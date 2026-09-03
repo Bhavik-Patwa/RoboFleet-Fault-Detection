@@ -1,0 +1,14 @@
+requests
+tqdm
+python-dotenv
+jupyter
+ipykernel
+pandas
+pyarrow
+scipy
+fastapi
+uvicorn[standard]
+boto3
+scikit-learn
+mlflow
+lightgbm

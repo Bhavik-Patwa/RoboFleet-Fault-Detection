@@ -1,0 +1,36 @@
+{
+  "dataset_name": "ALFA",
+  "storage_backend": "s3",
+  "bucket_name": "robotics-fleet-alfa",
+  "bucket_prefix": "alfa",
+  "sections": {
+    "processed": {
+      "s3_prefix": "alfa/processed",
+      "expected": {
+        "directories": 47,
+        "csv_files": 1590,
+        "mat_files": 47,
+        "bag_files": 47
+      }
+    },
+    "raw": {
+      "s3_prefix": "alfa/raw",
+      "expected": {
+        "bag_files": 39
+      }
+    },
+    "telemetry": {
+      "s3_prefix": "alfa/telemetry",
+      "expected": {
+        "tlog_files": 41,
+        "parm_files": 35
+      }
+    },
+    "dataflash": {
+      "s3_prefix": "alfa/dataflash",
+      "expected": {
+        "bin_files": 10
+      }
+    }
+  }
+}

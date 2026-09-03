@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environment
+.env
+.DS_Store
+.vscode/settings.json
+
+# Local data and generated artifacts
+data/
+mlruns/
+mlflow.db*
+logs/
+tmp/
+
+# AWS S3 Access Key credentials
+robotics-fleet-data-ingestion_accessKeys.csv
