@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -97,9 +98,9 @@ def parse_args() -> argparse.Namespace:
         default = 5
     )
 
-    # Separating fold count for out-of-fold threshold calibration
+    # Using separate inner folds for model selection and threshold calibration
     parser.add_argument(
-        "--calibration-fold-count",
+        "--inner-fold-count",
         type = int,
         default = 4
     )
@@ -192,7 +193,7 @@ def load_training_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict
     ].copy()
 
     if labeled_windows.empty:
-        raise RuntimeError("No labelled telemetry windows are available.")
+        raise RuntimeError("No labeled telemetry windows are available.")
 
     # Creating binary target column from window labels
     labeled_windows["target"] = labeled_windows["window_label"].eq(
@@ -211,7 +212,7 @@ def load_training_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict
 # Comprehensive validation of training data integrity and suitability
 def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
                            flight_reference: pd.DataFrame, feature_columns: list[str],
-                           fold_count: int, calibration_fold_count: int
+                           fold_count: int, inner_fold_count: int
 ) -> None:
     # Ensuring all expected columns are present in the dataset
     required_columns = METADATA_COLUMNS.union(feature_columns)
@@ -256,6 +257,33 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     # Building flight labels and validating split counts
     flight_labels = build_flight_labels(labeled_windows)
 
+    fault_flights = flight_labels.loc[
+        flight_labels["target"].eq(1),
+        "flight_name"
+    ]
+
+    flight_reference_by_name = flight_reference.set_index("flight_name")
+
+    missing_failure_times = [
+        flight_name
+        for flight_name in fault_flights
+        if (
+            flight_name not in flight_reference_by_name.index
+            or pd.isna(
+                flight_reference_by_name.loc[
+                    flight_name,
+                    "first_fault_signal_time"
+                ]
+            )
+        )
+    ]
+
+    if missing_failure_times:
+        raise RuntimeError(
+            "Fault flights are missing failure-status timestamps: "
+            f"{sorted(missing_failure_times)}"
+        )
+
     validate_split_count(
         flight_labels = flight_labels,
         fold_count = fold_count
@@ -270,7 +298,15 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     )
 
     # Verifying sufficient normal flights for calibration
-    if normal_flight_count - 2 < calibration_fold_count:
+    maximum_test_normal_flight_count = math.ceil(
+        normal_flight_count / fold_count
+    )
+
+    minimum_training_normal_flight_count = (
+        normal_flight_count - maximum_test_normal_flight_count
+    )
+
+    if minimum_training_normal_flight_count < inner_fold_count:
         raise RuntimeError(
             "Outer training partitions do not contain enough normal flights for the requested calibration fold count."
         )
@@ -402,13 +438,14 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
             }
         )
 
-    # Selecting configuration with highest mean ROC-AUC and lowest variance
+    # Selecting by mean ROC-AUC, stability and then lower model complexity
     selected_record = max(
         configuration_records,
         key = lambda record: (
             record["inner_flight_roc_auc_mean"],
             -record["inner_flight_roc_auc_standard_deviation"],
-            record["model_configuration_name"]
+            -record["parameters"]["num_leaves"],
+            -record["parameters"]["n_estimators"]
         )
     )
 
@@ -421,11 +458,11 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
     return selected_configuration, configuration_records
 
 
-# Generating calibration scores from normal windows using inner cross-validation
-def collect_calibration_scores(training_windows: pd.DataFrame, feature_columns: list[str],
-                               model_configuration: dict, fold_count: int,
-                               outer_fold_number: int
-) -> np.ndarray:
+# Generating calibration predictions from normal windows using inner cross-validation
+def collect_calibration_predictions(training_windows: pd.DataFrame, feature_columns: list[str],
+                                    model_configuration: dict, fold_count: int,
+                                    random_state_offset: int
+) -> pd.DataFrame:
     flight_labels = build_flight_labels(training_windows)
 
     validate_split_count(
@@ -437,12 +474,12 @@ def collect_calibration_scores(training_windows: pd.DataFrame, feature_columns: 
     splitter = StratifiedKFold(
         n_splits = fold_count,
         shuffle = True,
-        random_state = RANDOM_STATE + outer_fold_number
+        random_state = RANDOM_STATE + random_state_offset
     )
 
-    calibration_scores = []
+    calibration_frames = []
 
-    # Iterating through inner folds to collect normal window scores
+    # Iterating through inner folds to collect normal window predictions
     for training_indices, validation_indices in splitter.split(
         flight_labels["flight_name"],
         flight_labels["target"]
@@ -471,24 +508,62 @@ def collect_calibration_scores(training_windows: pd.DataFrame, feature_columns: 
             inner_training_windows["target"]
         )
 
-        # Collecting probability scores for normal validation windows
-        calibration_scores.extend(
-            classifier.predict_proba(
-                inner_validation_normal_windows[feature_columns]
-            )[:, 1]
+        # Storing flight name and probability for each normal validation window
+        calibration_frames.append(
+            pd.DataFrame(
+                {
+                    "flight_name": (
+                        inner_validation_normal_windows["flight_name"]
+                        .to_numpy()
+                    ),
+                    "fault_probability": classifier.predict_proba(
+                        inner_validation_normal_windows[feature_columns]
+                    )[:, 1]
+                }
+            )
         )
 
-    calibration_scores = np.asarray(calibration_scores, dtype = "float64")
+    calibration_predictions = pd.concat(
+        calibration_frames,
+        ignore_index = True
+    )
 
-    if len(calibration_scores) == 0:
-        raise RuntimeError("No normal calibration scores were generated.")
+    expected_normal_flight_count = int(
+        flight_labels.loc[
+            flight_labels["target"].eq(0),
+            "flight_name"
+        ].nunique()
+    )
 
-    return calibration_scores
+    # Verifying that calibration covers every normal training flight
+    if (
+        calibration_predictions["flight_name"].nunique()
+        != expected_normal_flight_count
+    ):
+        raise RuntimeError(
+            "Calibration predictions do not cover every normal training flight."
+        )
+
+    return calibration_predictions
 
 
-# Creating unique thresholds from calibration scores for online detection
-def build_thresholds(calibration_scores: np.ndarray) -> np.ndarray:
-    thresholds = np.unique(calibration_scores)
+# Creating unique thresholds from per-flight maximum probabilities
+def build_thresholds(calibration_predictions: pd.DataFrame) -> np.ndarray:
+    # Computing maximum probability per normal flight for threshold calibration
+    normal_flight_scores = (
+        calibration_predictions
+        .groupby("flight_name", as_index = False)
+        .agg(
+            maximum_fault_probability = (
+                "fault_probability",
+                "max"
+            )
+        )
+    )
+
+    thresholds = np.unique(
+        normal_flight_scores["maximum_fault_probability"].to_numpy()
+    )
 
     # Adding a threshold slightly above the maximum for complete coverage
     return np.append(
@@ -500,7 +575,7 @@ def build_thresholds(calibration_scores: np.ndarray) -> np.ndarray:
 # Evaluating online detection performance across all thresholds
 def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.DataFrame,
                               failure_times: pd.Series, thresholds: np.ndarray,
-                              calibration_scores: np.ndarray, fold_number: int,
+                              calibration_predictions: pd.DataFrame, fold_number: int,
                               model_configuration_name: str
 ) -> list[dict]:
     normal_flights = set(
@@ -515,6 +590,18 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
             flight_labels["target"].eq(1),
             "flight_name"
         ]
+    )
+
+    # Computing per-flight maximum probabilities from calibration data
+    normal_flight_scores = (
+        calibration_predictions
+        .groupby("flight_name", as_index = False)
+        .agg(
+            maximum_fault_probability = (
+                "fault_probability",
+                "max"
+            )
+        )
     )
 
     threshold_records = []
@@ -581,8 +668,12 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                 "fold_number": fold_number,
                 "model_configuration_name": model_configuration_name,
                 "threshold": float(threshold),
-                "calibration_normal_window_alert_rate": float(
-                    np.mean(calibration_scores >= threshold)
+                "calibration_normal_flight_alert_rate": float(
+                    np.mean(
+                        normal_flight_scores[
+                            "maximum_fault_probability"
+                        ].ge(threshold)
+                    )
                 ),
                 "normal_flight_count": len(normal_flights),
                 "normal_flight_false_alert_count": normal_false_alert_count,
@@ -627,7 +718,7 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
 # Evaluating model performance using grouped cross-validation by flight
 def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
                            flight_reference: pd.DataFrame, feature_columns: list[str],
-                           fold_count: int, calibration_fold_count: int
+                           fold_count: int, inner_fold_count: int
 ) -> tuple[list[dict], list[dict], list[dict]]:
     flight_labels = build_flight_labels(labeled_windows)
 
@@ -683,7 +774,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             select_model_configuration(
                 training_windows = training_windows,
                 feature_columns = feature_columns,
-                fold_count = calibration_fold_count,
+                fold_count = inner_fold_count,
                 outer_fold_number = fold_number
             )
         )
@@ -722,13 +813,13 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             probabilities = test_probabilities
         )
 
-        # Collecting calibration scores from training data using inner cross-validation
-        calibration_scores = collect_calibration_scores(
+        # Collecting calibration predictions from training data
+        calibration_predictions = collect_calibration_predictions(
             training_windows = training_windows,
             feature_columns = feature_columns,
             model_configuration = selected_configuration,
-            fold_count = calibration_fold_count,
-            outer_fold_number = fold_number
+            fold_count = inner_fold_count,
+            random_state_offset = fold_number
         )
 
         # Scoring all windows for test flights for online detection evaluation
@@ -746,8 +837,8 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 scored_windows = test_windows,
                 flight_labels = test_flight_labels,
                 failure_times = failure_times,
-                thresholds = build_thresholds(calibration_scores),
-                calibration_scores = calibration_scores,
+                thresholds = build_thresholds(calibration_predictions),
+                calibration_predictions = calibration_predictions,
                 fold_number = fold_number,
                 model_configuration_name = selected_configuration["name"]
             )
@@ -774,8 +865,11 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 ),
                 "window_roc_auc": float(window_roc_auc),
                 "flight_roc_auc": float(flight_roc_auc),
+                "calibration_normal_flight_count": int(
+                    calibration_predictions["flight_name"].nunique()
+                ),
                 "calibration_normal_window_count": int(
-                    len(calibration_scores)
+                    len(calibration_predictions)
                 )
             }
         )
@@ -802,7 +896,7 @@ def main() -> None:
         flight_reference = flight_reference,
         feature_columns = feature_columns,
         fold_count = args.fold_count,
-        calibration_fold_count = args.calibration_fold_count
+        inner_fold_count = args.inner_fold_count
     )
 
     (
@@ -815,29 +909,28 @@ def main() -> None:
         flight_reference = flight_reference,
         feature_columns = feature_columns,
         fold_count = args.fold_count,
-        calibration_fold_count = args.calibration_fold_count
+        inner_fold_count = args.inner_fold_count
     )
 
     fold_metrics = pd.DataFrame(fold_records)
 
     # Counting how often each configuration was selected across outer folds
-    configuration_selection_counts = (
+    outer_configuration_selection_counts = (
         fold_metrics["model_configuration_name"]
         .value_counts()
         .sort_index()
         .to_dict()
     )
 
-    # Selecting the most frequently chosen configuration as final model
-    selected_configuration_name = max(
-        configuration_selection_counts,
-        key = configuration_selection_counts.get
-    )
-
-    final_configuration = next(
-        configuration
-        for configuration in MODEL_CONFIGURATIONS
-        if configuration["name"] == selected_configuration_name
+    # Performing final model selection using full dataset and inner cross-validation
+    (
+        final_configuration,
+        final_configuration_selection_metrics
+    ) = select_model_configuration(
+        training_windows = labeled_windows,
+        feature_columns = feature_columns,
+        fold_count = args.inner_fold_count,
+        outer_fold_number = 0
     )
 
     # Fitting the final model on all labeled windows
@@ -857,7 +950,7 @@ def main() -> None:
     input_example = labeled_windows[feature_columns].head(5)
     input_example_probabilities = final_classifier.predict_proba(
         input_example
-    )[:, 1]
+    )
 
     model_signature = infer_signature(
         input_example,
@@ -875,7 +968,7 @@ def main() -> None:
                 "model_type": "LightGBMClassifier",
                 "random_state": RANDOM_STATE,
                 "fold_count": args.fold_count,
-                "calibration_fold_count": args.calibration_fold_count,
+                "inner_fold_count": args.inner_fold_count,
                 "final_model_configuration": final_configuration["name"],
                 "source_topic_count": manifest["source_topic_count"],
                 "source_column_count": manifest["source_column_count"],
@@ -926,7 +1019,12 @@ def main() -> None:
                     TRAINING_FLIGHT_REFERENCE_PATH
                 ),
                 "model_configurations": MODEL_CONFIGURATIONS,
-                "configuration_selection_counts": configuration_selection_counts,
+                "outer_configuration_selection_counts": (
+                    outer_configuration_selection_counts
+                ),
+                "final_configuration_selection_metrics": (
+                    final_configuration_selection_metrics
+                ),
                 "fold_metrics": fold_records,
                 "inner_configuration_metrics": selection_records,
                 "online_detection_threshold_metrics": threshold_records
@@ -945,7 +1043,8 @@ def main() -> None:
                 "collections.OrderedDict",
                 "lightgbm.basic.Booster",
                 "lightgbm.sklearn.LGBMClassifier"
-            ]
+            ],
+            pyfunc_predict_fn = "predict_proba"
         )
 
         print(f"MLflow run ID : {run.info.run_id}")
