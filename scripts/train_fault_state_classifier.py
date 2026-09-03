@@ -11,7 +11,7 @@ import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 
@@ -34,6 +34,7 @@ METADATA_COLUMNS = {
 RANDOM_STATE = 42
 
 
+# Parsing command-line arguments for experiment configuration
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Verifying that all required input files exist before proceeding
 def ensure_inputs_exist() -> None:
     required_paths = [
         WINDOW_DATASET_PATH,
@@ -66,9 +68,10 @@ def ensure_inputs_exist() -> None:
 
     if missing_paths:
         missing_text = "\n".join(str(path) for path in missing_paths)
-        raise FileNotFoundError(f"Required input paths not found :\n{missing_text}")
+        raise FileNotFoundError(f"Required input paths not found : \n{missing_text}")
 
 
+# Computing SHA256 hash of a file for data integrity tracking
 def calculate_file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
 
@@ -79,17 +82,19 @@ def calculate_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Loading and preparing training data from parquet and manifest files
 def load_training_data() -> tuple[pd.DataFrame, dict, list[str]]:
     window_dataset = pd.read_parquet(WINDOW_DATASET_PATH)
     manifest = json.loads(WINDOW_MANIFEST_PATH.read_text())
 
+    # Identifying feature columns by excluding metadata columns
     feature_columns = [
         column_name
         for column_name in window_dataset.columns
         if column_name not in METADATA_COLUMNS
     ]
 
-    # Excluding pre-fault windows because they do not have a definitive class label
+    # Filtering only labeled windows for supervised learning
     labeled_windows = window_dataset.loc[
         window_dataset["window_label"].isin(["normal", "fault_state"])
     ].copy()
@@ -97,27 +102,29 @@ def load_training_data() -> tuple[pd.DataFrame, dict, list[str]]:
     if labeled_windows.empty:
         raise RuntimeError("No labeled telemetry windows are available.")
 
+    # Creating binary target column from window labels
     labeled_windows["target"] = labeled_windows["window_label"].eq(
         "fault_state"
     ).astype(int)
 
+    # Validating that features contain no missing values
     if labeled_windows[feature_columns].isna().any().any():
         raise RuntimeError("Labeled telemetry windows contain missing feature values.")
 
     feature_values = labeled_windows[feature_columns].to_numpy(dtype = "float64")
 
+    # Validating that all feature values are finite numbers
     if not np.isfinite(feature_values).all():
         raise RuntimeError("Labeled telemetry windows contain non-finite feature values.")
 
-    if labeled_windows["flight_name"].nunique() < 10:
-        raise RuntimeError("Insufficient flight groups for grouped validation.")
-
+    # Ensuring both classes are present for binary classification
     if labeled_windows["target"].nunique() != 2:
         raise RuntimeError("Both normal and fault-state labels are required.")
 
     return labeled_windows, manifest, feature_columns
 
 
+# Building the classification pipeline with variance filter and LightGBM
 def build_classifier() -> Pipeline:
     return Pipeline(
         steps = [
@@ -135,13 +142,35 @@ def build_classifier() -> Pipeline:
     )
 
 
+# Evaluating model performance using grouped cross-validation by flight
 def evaluate_grouped_folds(labeled_windows: pd.DataFrame, feature_columns: list[str], fold_count: int) -> list[dict]:
-    features = labeled_windows[feature_columns]
-    targets = labeled_windows["target"]
-    groups = labeled_windows["flight_name"]
+    # Extracting unique flight-level labels with their target classifications
+    flight_labels = (
+        labeled_windows[["flight_name", "target"]]
+        .drop_duplicates()
+        .sort_values("flight_name")
+        .reset_index(drop = True)
+    )
 
-    # Keeping every window from a flight in exactly one validation partition
-    splitter = StratifiedGroupKFold(
+    # Verifying that no flight has conflicting classification labels across windows
+    if flight_labels["flight_name"].duplicated().any():
+        raise RuntimeError("A flight has conflicting classification labels.")
+
+    # Ensuring the fold count is sufficient for meaningful cross-validation
+    if fold_count < 2:
+        raise ValueError("Fold count must be at least 2.")
+
+    # Counting how many flights belong to each target class
+    class_flight_counts = flight_labels["target"].value_counts()
+
+    # Validating that each class has enough flights to support the requested fold count
+    if class_flight_counts.min() < fold_count:
+        raise RuntimeError(
+            "Each class must contain at least as many flights as the fold count."
+        )
+
+    # Initializing stratified k-fold splitter to preserve class distribution across folds
+    splitter = StratifiedKFold(
         n_splits = fold_count,
         shuffle = True,
         random_state = RANDOM_STATE
@@ -149,13 +178,40 @@ def evaluate_grouped_folds(labeled_windows: pd.DataFrame, feature_columns: list[
 
     fold_records = []
 
-    for fold_number, (training_indices, test_indices) in enumerate(
-        splitter.split(features, targets, groups),
+    # Iterating through each fold to train and evaluate the model
+    for fold_number, (training_flight_indices, test_flight_indices) in enumerate(
+        splitter.split(
+            flight_labels["flight_name"],
+            flight_labels["target"]
+        ),
         start = 1
     ):
-        training_windows = labeled_windows.iloc[training_indices]
-        test_windows = labeled_windows.iloc[test_indices]
+        # Extracting flight names for training and testing partitions
+        training_flights = set(
+            flight_labels.iloc[training_flight_indices]["flight_name"]
+        )
 
+        test_flights = set(
+            flight_labels.iloc[test_flight_indices]["flight_name"]
+        )
+
+        # Ensuring no flight leaks between training and test sets
+        if training_flights.intersection(test_flights):
+            raise RuntimeError(
+                "A flight is present in both training and test partitions."
+            )
+
+        # Filtering windows belonging to training flights
+        training_windows = labeled_windows.loc[
+            labeled_windows["flight_name"].isin(training_flights)
+        ]
+
+        # Filtering windows belonging to test flights
+        test_windows = labeled_windows.loc[
+            labeled_windows["flight_name"].isin(test_flights)
+        ]
+
+        # Building and training a fresh classifier for this fold
         classifier = build_classifier()
 
         classifier.fit(
@@ -163,51 +219,56 @@ def evaluate_grouped_folds(labeled_windows: pd.DataFrame, feature_columns: list[
             training_windows["target"]
         )
 
+        # Generating probability predictions for test windows
         test_probabilities = classifier.predict_proba(
             test_windows[feature_columns]
         )[:, 1]
 
+        # Computing window-level ROC-AUC score
         window_roc_auc = roc_auc_score(
             test_windows["target"],
             test_probabilities
         )
-        # Aggregating overlapping window scores so each flight contributes one evaluation score
-        flight_predictions = pd.DataFrame(
-            {
-                "flight_name": test_windows["flight_name"].to_numpy(),
-                "target": test_windows["target"].to_numpy(),
-                "fault_probability": test_probabilities
-            }
-        ).groupby(
-            ["flight_name", "target"],
-            as_index = False
-        ).agg(
-            fault_probability = ("fault_probability", "median")
+
+        # Aggregating predictions to flight level using median probability per flight
+        flight_predictions = (
+            pd.DataFrame(
+                {
+                    "flight_name": test_windows["flight_name"].to_numpy(),
+                    "target": test_windows["target"].to_numpy(),
+                    "fault_probability": test_probabilities
+                }
+            )
+            .groupby(
+                ["flight_name", "target"],
+                as_index = False
+            )
+            .agg(
+                fault_probability = ("fault_probability", "median")
+            )
         )
 
+        # Computing flight-level ROC-AUC score
         flight_roc_auc = roc_auc_score(
             flight_predictions["target"],
             flight_predictions["fault_probability"]
         )
 
+        # Storing comprehensive fold metrics for later analysis
         fold_records.append(
             {
                 "fold_number": fold_number,
-                "training_flight_count": int(
-                    training_windows["flight_name"].nunique()
-                ),
-                "test_flight_count": int(
-                    test_windows["flight_name"].nunique()
-                ),
+                "training_flight_count": int(len(training_flights)),
+                "test_flight_count": int(len(test_flights)),
                 "test_normal_flight_count": int(
-                    test_windows.loc[
-                        test_windows["target"].eq(0),
+                    flight_predictions.loc[
+                        flight_predictions["target"].eq(0),
                         "flight_name"
                     ].nunique()
                 ),
                 "test_fault_flight_count": int(
-                    test_windows.loc[
-                        test_windows["target"].eq(1),
+                    flight_predictions.loc[
+                        flight_predictions["target"].eq(1),
                         "flight_name"
                     ].nunique()
                 ),
@@ -234,7 +295,7 @@ def main() -> None:
 
     fold_metrics = pd.DataFrame(fold_records)
 
-    # Training the artifact on all labelled windows after cross-validation is complete
+    # Training final model on all labeled data
     final_classifier = build_classifier()
 
     final_classifier.fit(
@@ -242,13 +303,16 @@ def main() -> None:
         labeled_windows["target"]
     )
 
+    # Counting features retained after variance threshold filtering
     retained_feature_count = int(
         final_classifier.named_steps["variance_filter"].get_support().sum()
     )
 
+    # Configuring MLflow tracking to use SQLite database
     mlflow.set_tracking_uri(f"sqlite:///{TRACKING_DATABASE_PATH}")
     mlflow.set_experiment(args.experiment_name)
 
+    # Logging all parameters, metrics and model artifacts to MLflow
     with mlflow.start_run(run_name = args.run_name) as run:
         mlflow.log_params(
             {
@@ -276,6 +340,7 @@ def main() -> None:
             }
         )
 
+        # Logging aggregated evaluation metrics
         mlflow.log_metrics(
             {
                 "window_roc_auc_mean": float(
@@ -293,6 +358,7 @@ def main() -> None:
             }
         )
 
+        # Logging manifest and evaluation metrics as JSON artifacts
         mlflow.log_dict(manifest, "telemetry_windows_manifest.json")
 
         mlflow.log_dict(
@@ -303,6 +369,7 @@ def main() -> None:
             "evaluation_metrics.json"
         )
 
+        # Saving the trained model with skops serialization format
         mlflow.sklearn.log_model(
             sk_model = final_classifier,
             name = "model",
