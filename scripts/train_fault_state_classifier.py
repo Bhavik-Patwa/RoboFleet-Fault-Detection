@@ -15,7 +15,7 @@ from lightgbm import LGBMClassifier
 from mlflow.models import infer_signature
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 
 
@@ -38,6 +38,7 @@ METADATA_COLUMNS = {
 }
 
 RANDOM_STATE = 42
+RECORDING_DATE_PATTERN = r"^carbonZ_(\d{4}-\d{2}-\d{2})-"
 
 # Defining multiple hyperparameter configurations for model selection
 MODEL_CONFIGURATIONS = [
@@ -120,19 +121,6 @@ def parse_args() -> argparse.Namespace:
         default = None
     )
 
-    parser.add_argument(
-        "--fold-count",
-        type = int,
-        default = 5
-    )
-
-    # Using separate inner folds for model selection and threshold calibration
-    parser.add_argument(
-        "--inner-fold-count",
-        type = int,
-        default = 4
-    )
-
     return parser.parse_args()
 
 
@@ -162,8 +150,32 @@ def calculate_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-# Extracting unique flight labels from labeled windows for stratified splitting
-def build_flight_labels(labeled_windows: pd.DataFrame) -> pd.DataFrame:
+# Extracting the recording date used as a conservative evaluation group
+def extract_recording_dates(flight_names: pd.Series) -> pd.Series:
+    recording_dates = flight_names.astype(str).str.extract(
+        RECORDING_DATE_PATTERN,
+        expand = False
+    )
+
+    if recording_dates.isna().any():
+        invalid_flights = sorted(
+            flight_names.loc[recording_dates.isna()]
+            .astype(str)
+            .unique()
+        )
+
+        raise RuntimeError(
+            "Recording dates could not be extracted from flights: "
+            f"{invalid_flights}"
+        )
+
+    return recording_dates
+
+
+# Extracting one label and one evaluation group for each flight
+def build_flight_labels(
+    labeled_windows: pd.DataFrame
+) -> pd.DataFrame:
     flight_labels = (
         labeled_windows[["flight_name", "target"]]
         .drop_duplicates()
@@ -171,24 +183,65 @@ def build_flight_labels(labeled_windows: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop = True)
     )
 
-    # Verifying that no flight has conflicting classification labels across windows
     if flight_labels["flight_name"].duplicated().any():
-        raise RuntimeError("A flight has conflicting fault-state labels.")
+        raise RuntimeError(
+            "A flight has conflicting fault-state labels."
+        )
+
+    flight_labels["recording_date"] = extract_recording_dates(
+        flight_labels["flight_name"]
+    )
 
     return flight_labels
 
 
-# Validating that each class has sufficient flights for the requested fold count
-def validate_split_count(flight_labels: pd.DataFrame, fold_count: int) -> None:
-    if fold_count < 2:
-        raise ValueError("Fold count must be at least 2.")
+# Building leave-one-recording-date-out splits and validating every partition
+def build_recording_date_splits(
+    flight_labels: pd.DataFrame
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    recording_date_count = int(
+        flight_labels["recording_date"].nunique()
+    )
 
-    # Counting how many flights belong to each target class
-    class_flight_counts = flight_labels["target"].value_counts()
+    if recording_date_count < 2:
+        raise RuntimeError(
+            "At least two recording dates are required."
+        )
 
-    # Validating that each class has enough flights to support the requested fold count
-    if class_flight_counts.min() < fold_count:
-        raise RuntimeError("Each class must contain at least as many flights as the fold count.")
+    splitter = LeaveOneGroupOut()
+
+    grouped_splits = list(
+        splitter.split(
+            flight_labels["flight_name"],
+            flight_labels["target"],
+            groups = flight_labels["recording_date"]
+        )
+    )
+
+    for training_indices, test_indices in grouped_splits:
+        training_labels = flight_labels.iloc[training_indices]
+        test_labels = flight_labels.iloc[test_indices]
+
+        held_out_recording_dates = (
+            test_labels["recording_date"].unique()
+        )
+
+        if len(held_out_recording_dates) != 1:
+            raise RuntimeError(
+                "A test fold contains more than one recording date."
+            )
+
+        if training_labels["target"].nunique() != 2:
+            raise RuntimeError(
+                "A grouped training fold does not contain both classes."
+            )
+
+        if test_labels["target"].nunique() != 2:
+            raise RuntimeError(
+                "A grouped test fold does not contain both classes."
+            )
+
+    return grouped_splits
 
 
 # Loading and preparing training data from parquet, manifest and flight reference
@@ -239,8 +292,7 @@ def load_training_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict
 
 # Comprehensive validation of training data integrity and suitability
 def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
-                           flight_reference: pd.DataFrame, feature_columns: list[str],
-                           fold_count: int, inner_fold_count: int
+                           flight_reference: pd.DataFrame, feature_columns: list[str]
 ) -> None:
     # Ensuring all expected columns are present in the dataset
     required_columns = METADATA_COLUMNS.union(feature_columns)
@@ -282,7 +334,7 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     if labeled_windows["target"].nunique() != 2:
         raise RuntimeError("Both normal and fault-state labels are required.")
 
-    # Building flight labels and validating split counts
+    # Building flight labels and validating recording-date partitions
     flight_labels = build_flight_labels(labeled_windows)
 
     fault_flights = flight_labels.loc[
@@ -290,10 +342,29 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
         "flight_name"
     ]
 
-    flight_reference_by_name = flight_reference.set_index("flight_name")
+    if flight_reference["flight_name"].duplicated().any():
+        duplicated_flights = sorted(
+            flight_reference.loc[
+                flight_reference["flight_name"].duplicated(
+                    keep = False
+                ),
+                "flight_name"
+            ]
+            .astype(str)
+            .unique()
+        )
+
+        raise RuntimeError(
+            "Training flight reference contains duplicate flights: "
+            f"{duplicated_flights}"
+        )
+
+    flight_reference_by_name = flight_reference.set_index(
+        "flight_name"
+    )
 
     missing_failure_times = [
-        flight_name
+        str(flight_name)
         for flight_name in fault_flights
         if (
             flight_name not in flight_reference_by_name.index
@@ -312,32 +383,8 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             f"{sorted(missing_failure_times)}"
         )
 
-    validate_split_count(
-        flight_labels = flight_labels,
-        fold_count = fold_count
-    )
-
-    # Estimating normal flight count for calibration sufficiency
-    normal_flight_count = int(
-        flight_labels.loc[
-            flight_labels["target"].eq(0),
-            "flight_name"
-        ].nunique()
-    )
-
-    # Verifying sufficient normal flights for calibration
-    maximum_test_normal_flight_count = math.ceil(
-        normal_flight_count / fold_count
-    )
-
-    minimum_training_normal_flight_count = (
-        normal_flight_count - maximum_test_normal_flight_count
-    )
-
-    if minimum_training_normal_flight_count < inner_fold_count:
-        raise RuntimeError(
-            "Outer training partitions do not contain enough normal flights for the requested calibration fold count."
-        )
+    # Confirming that every recording-date fold contains both classes
+    build_recording_date_splits(flight_labels)
 
 
 # Building the classification pipeline with specified model configuration
@@ -506,7 +553,9 @@ def calculate_flight_roc_auc(
 
 # Benchmarking every fixed candidate against the same untouched flight set
 def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_windows: pd.DataFrame,
-                                       feature_columns: list[str], fold_number: int
+                                       feature_columns: list[str], fold_number: int,
+                                       held_out_recording_date: str
+
 ) -> list[dict]:
     benchmark_records = []
 
@@ -526,6 +575,7 @@ def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_wind
         benchmark_records.append(
             {
                 "fold_number": fold_number,
+                "held_out_recording_date": held_out_recording_date,
                 "model_configuration_name": model_configuration["name"],
                 "model_type": model_configuration["model_type"],
                 "window_roc_auc": float(
@@ -545,17 +595,20 @@ def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_wind
 
 
 # Creating JSON-safe held-out window prediction records
-def build_window_prediction_records(
-    scored_windows: pd.DataFrame,
-    fold_number: int,
-    model_configuration_name: str
+def build_window_prediction_records(scored_windows: pd.DataFrame, fold_number: int,
+                                    held_out_recording_date: str, model_configuration_name: str
 ) -> list[dict]:
     return [
         {
             "fold_number": fold_number,
+            "held_out_recording_date": held_out_recording_date,
             "model_configuration_name": model_configuration_name,
             "flight_name": str(row.flight_name),
-            "fault_family_label": str(row.fault_family_label),
+            "fault_family_label": (
+                None
+                if pd.isna(row.fault_family_label)
+                else str(row.fault_family_label)
+            ),
             "window_start_ns": int(row.window_start_ns),
             "window_end_ns": int(row.window_end_ns),
             "window_label": str(row.window_label),
@@ -575,33 +628,20 @@ def build_window_prediction_records(
 
 
 # Selecting the best model configuration using inner cross-validation
-def select_model_configuration(training_windows: pd.DataFrame, feature_columns: list[str],
-                               fold_count: int, outer_fold_number: int
+def select_model_configuration(training_windows: pd.DataFrame, feature_columns: list[str]
 ) -> tuple[dict, list[dict]]:
     flight_labels = build_flight_labels(training_windows)
 
-    validate_split_count(
-        flight_labels = flight_labels,
-        fold_count = fold_count
-    )
-
-    # Creating inner stratified folds for configuration selection
-    splitter = StratifiedKFold(
-        n_splits = fold_count,
-        shuffle = True,
-        random_state = RANDOM_STATE + outer_fold_number
+    grouped_splits = build_recording_date_splits(
+        flight_labels
     )
 
     configuration_records = []
 
-    # Evaluating each model configuration using inner cross-validation
     for model_configuration in MODEL_CONFIGURATIONS:
         fold_scores = []
 
-        for training_indices, validation_indices in splitter.split(
-            flight_labels["flight_name"],
-            flight_labels["target"]
-        ):
+        for training_indices, validation_indices in grouped_splits:
             inner_training_flights = set(
                 flight_labels.iloc[training_indices]["flight_name"]
             )
@@ -611,11 +651,15 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
             )
 
             inner_training_windows = training_windows.loc[
-                training_windows["flight_name"].isin(inner_training_flights)
+                training_windows["flight_name"].isin(
+                    inner_training_flights
+                )
             ]
 
             inner_validation_windows = training_windows.loc[
-                training_windows["flight_name"].isin(inner_validation_flights)
+                training_windows["flight_name"].isin(
+                    inner_validation_flights
+                )
             ]
 
             classifier = build_classifier(model_configuration)
@@ -637,13 +681,15 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
                 )
             )
 
-        # Recording performance metrics for this configuration
+        # Recording grouped validation performance for this configuration
         configuration_records.append(
             {
                 "model_configuration_name": model_configuration["name"],
                 "model_type": model_configuration["model_type"],
                 "model_complexity": model_configuration["model_complexity"],
-                "inner_flight_roc_auc_mean": float(np.mean(fold_scores)),
+                "inner_flight_roc_auc_mean": float(
+                    np.mean(fold_scores)
+                ),
                 "inner_flight_roc_auc_standard_deviation": float(
                     np.std(fold_scores, ddof = 0)
                 ),
@@ -662,6 +708,8 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
             -record["inner_flight_roc_auc_mean"],
             record["inner_flight_roc_auc_standard_deviation"],
             record["model_complexity"],
+            record["parameters"].get("num_leaves", 0),
+            record["parameters"].get("n_estimators", 0),
             record["model_configuration_name"]
         )
     )
@@ -677,30 +725,18 @@ def select_model_configuration(training_windows: pd.DataFrame, feature_columns: 
 
 # Generating calibration predictions from normal windows using inner cross-validation
 def collect_calibration_predictions(training_windows: pd.DataFrame, feature_columns: list[str],
-                                    model_configuration: dict, fold_count: int,
-                                    random_state_offset: int
+                                    model_configuration: dict
 ) -> pd.DataFrame:
     flight_labels = build_flight_labels(training_windows)
 
-    validate_split_count(
-        flight_labels = flight_labels,
-        fold_count = fold_count
-    )
-
-    # Creating inner stratified folds for calibration
-    splitter = StratifiedKFold(
-        n_splits = fold_count,
-        shuffle = True,
-        random_state = RANDOM_STATE + random_state_offset
+    grouped_splits = build_recording_date_splits(
+        flight_labels
     )
 
     calibration_frames = []
 
-    # Iterating through inner folds to collect normal window predictions
-    for training_indices, validation_indices in splitter.split(
-        flight_labels["flight_name"],
-        flight_labels["target"]
-    ):
+    # Iterating through grouped splits to collect normal window predictions
+    for training_indices, validation_indices in grouped_splits:
         inner_training_flights = set(
             flight_labels.iloc[training_indices]["flight_name"]
         )
@@ -794,7 +830,7 @@ def build_thresholds(calibration_predictions: pd.DataFrame) -> np.ndarray:
 def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.DataFrame,
                               failure_times: pd.Series, thresholds: np.ndarray,
                               calibration_predictions: pd.DataFrame, fold_number: int,
-                              model_configuration_name: str
+                              held_out_recording_date: str, model_configuration_name: str
 ) -> list[dict]:
     normal_flights = set(
         flight_labels.loc[
@@ -847,26 +883,36 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                 scored_windows["flight_name"].eq(flight_name)
             ].sort_values("window_end_ns")
 
-            failure_time_ns = int(round(float(failure_times.loc[flight_name])))
+            failure_time_ns = int(
+                round(float(failure_times.loc[flight_name]))
+            )
 
             # Windows ending before the first recorded failure-status signal
             pre_observed_signal_windows = flight_windows.loc[
-                flight_windows["window_end_ns"].lt(failure_time_ns)
+                flight_windows["window_end_ns"].lt(
+                    failure_time_ns
+                )
             ]
 
             if not pre_observed_signal_windows.empty:
                 pre_observed_signal_evaluation_count += 1
 
-                if pre_observed_signal_windows["fault_probability"].ge(threshold).any():
+                if pre_observed_signal_windows[
+                    "fault_probability"
+                ].ge(threshold).any():
                     pre_observed_signal_alert_count += 1
 
-            # Windows ending at or after the recorded failure-status time
-            post_failure_windows = flight_windows.loc[
-                flight_windows["window_end_ns"].ge(failure_time_ns)
+            # Windows ending at or after the first recorded failure-status signal
+            post_observed_signal_windows = flight_windows.loc[
+                flight_windows["window_end_ns"].ge(
+                    failure_time_ns
+                )
             ]
 
-            detection_windows = post_failure_windows.loc[
-                post_failure_windows["fault_probability"].ge(threshold)
+            detection_windows = post_observed_signal_windows.loc[
+                post_observed_signal_windows[
+                    "fault_probability"
+                ].ge(threshold)
             ]
 
             if not detection_windows.empty:
@@ -874,9 +920,11 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                     detection_windows["window_end_ns"].iloc[0]
                 )
 
-                # Calculating detection delay in seconds
                 detection_delays.append(
-                    (first_detection_time_ns - failure_time_ns) / 1e9
+                    (
+                        first_detection_time_ns
+                        - failure_time_ns
+                    ) / 1e9
                 )
 
                 detected_fault_flight_count += 1
@@ -884,6 +932,7 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
         threshold_records.append(
             {
                 "fold_number": fold_number,
+                "held_out_recording_date": held_out_recording_date,
                 "model_configuration_name": model_configuration_name,
                 "threshold": float(threshold),
                 "calibration_normal_flight_alert_rate": float(
@@ -917,12 +966,12 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                     if pre_observed_signal_evaluation_count > 0
                     else None
                 ),
-                "mean_detection_delay_seconds": (
+                "mean_post_observed_signal_detection_delay_seconds": (
                     float(np.mean(detection_delays))
                     if detection_delays
                     else None
                 ),
-                "maximum_detection_delay_seconds": (
+                "maximum_post_observed_signal_detection_delay_seconds": (
                     float(np.max(detection_delays))
                     if detection_delays
                     else None
@@ -935,17 +984,13 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
 
 # Evaluating model selection, all candidate benchmarks and held-out predictions
 def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
-                           flight_reference: pd.DataFrame, feature_columns: list[str],
-                           fold_count: int, inner_fold_count: int
+                           flight_reference: pd.DataFrame, feature_columns: list[str]
 ) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict]]:
 
     flight_labels = build_flight_labels(labeled_windows)
 
-    # Keeping every flight entirely inside either training or test data
-    splitter = StratifiedKFold(
-        n_splits = fold_count,
-        shuffle = True,
-        random_state = RANDOM_STATE
+    grouped_splits = build_recording_date_splits(
+        flight_labels
     )
 
     failure_times = flight_reference.set_index("flight_name")[
@@ -960,12 +1005,15 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     out_of_fold_window_prediction_records = []
 
     for fold_number, (training_indices, test_indices) in enumerate(
-        splitter.split(
-            flight_labels["flight_name"],
-            flight_labels["target"]
-        ),
+        grouped_splits,
         start = 1
     ):
+        held_out_recording_date = str(
+            flight_labels.iloc[test_indices][
+                "recording_date"
+            ].iloc[0]
+        )
+        
         training_flights = set(
             flight_labels.iloc[training_indices]["flight_name"]
         )
@@ -993,7 +1041,8 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 training_windows = training_windows,
                 test_windows = test_labeled_windows,
                 feature_columns = feature_columns,
-                fold_number = fold_number
+                fold_number = fold_number,
+                held_out_recording_date = held_out_recording_date
             )
         )
 
@@ -1001,9 +1050,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
         selected_configuration, inner_selection_records = (
             select_model_configuration(
                 training_windows = training_windows,
-                feature_columns = feature_columns,
-                fold_count = inner_fold_count,
-                outer_fold_number = fold_number
+                feature_columns = feature_columns
             )
         )
 
@@ -1011,6 +1058,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             selection_records.append(
                 {
                     "outer_fold_number": fold_number,
+                    "held_out_recording_date": held_out_recording_date,
                     **record
                 }
             )
@@ -1047,6 +1095,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             out_of_fold_flight_prediction_records.append(
                 {
                     "fold_number": fold_number,
+                    "held_out_recording_date": held_out_recording_date,
                     "model_configuration_name": selected_configuration["name"],
                     **record
                 }
@@ -1055,9 +1104,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
         calibration_predictions = collect_calibration_predictions(
             training_windows = training_windows,
             feature_columns = feature_columns,
-            model_configuration = selected_configuration,
-            fold_count = inner_fold_count,
-            random_state_offset = fold_number
+            model_configuration = selected_configuration
         )
 
         # Scoring every window from held-out flights without retraining
@@ -1069,6 +1116,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             build_window_prediction_records(
                 scored_windows = test_windows,
                 fold_number = fold_number,
+                held_out_recording_date = held_out_recording_date,
                 model_configuration_name = selected_configuration["name"]
             )
         )
@@ -1085,6 +1133,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 thresholds = build_thresholds(calibration_predictions),
                 calibration_predictions = calibration_predictions,
                 fold_number = fold_number,
+                held_out_recording_date = held_out_recording_date,
                 model_configuration_name = selected_configuration["name"]
             )
         )
@@ -1114,7 +1163,8 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 ),
                 "calibration_normal_window_count": int(
                     len(calibration_predictions)
-                )
+                ),
+                "held_out_recording_date": held_out_recording_date
             }
         )
 
@@ -1145,9 +1195,7 @@ def main() -> None:
         window_dataset = window_dataset,
         labeled_windows = labeled_windows,
         flight_reference = flight_reference,
-        feature_columns = feature_columns,
-        fold_count = args.fold_count,
-        inner_fold_count = args.inner_fold_count
+        feature_columns = feature_columns
     )
 
     (
@@ -1161,9 +1209,7 @@ def main() -> None:
         window_dataset = window_dataset,
         labeled_windows = labeled_windows,
         flight_reference = flight_reference,
-        feature_columns = feature_columns,
-        fold_count = args.fold_count,
-        inner_fold_count = args.inner_fold_count
+        feature_columns = feature_columns
     )
 
     fold_metrics = pd.DataFrame(fold_records)
@@ -1245,9 +1291,7 @@ def main() -> None:
         final_configuration_selection_metrics
     ) = select_model_configuration(
         training_windows = labeled_windows,
-        feature_columns = feature_columns,
-        fold_count = args.inner_fold_count,
-        outer_fold_number = 0
+        feature_columns = feature_columns
     )
 
     # Fitting the final model on all labeled windows
@@ -1285,8 +1329,14 @@ def main() -> None:
             {
                 "model_type": final_configuration["model_type"],
                 "random_state": RANDOM_STATE,
-                "fold_count": args.fold_count,
-                "inner_fold_count": args.inner_fold_count,
+                "validation_strategy": (
+                    "nested_leave_one_recording_date_out"
+                ),
+                "recording_date_count": int(
+                    build_flight_labels(
+                        labeled_windows
+                    )["recording_date"].nunique()
+                ),
                 "final_model_configuration": final_configuration["name"],
                 "source_topic_count": manifest["source_topic_count"],
                 "source_column_count": manifest["source_column_count"],
