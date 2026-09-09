@@ -38,7 +38,8 @@ def parse_args() -> argparse.Namespace:
 
 
 # Validating explicit alert budgets and requiring one analysis mode
-def validate_alert_rate_arguments(target_alert_rates: list[float], include_all_achievable_alert_rates: bool) -> None:
+def validate_alert_rate_arguments(target_alert_rates: list[float], include_all_achievable_alert_rates: bool
+) -> None:
     if (
         not target_alert_rates
         and not include_all_achievable_alert_rates
@@ -55,23 +56,34 @@ def validate_alert_rate_arguments(target_alert_rates: list[float], include_all_a
         raise ValueError(f"Target normal-flight alert rates must be between zero and one : {invalid_alert_rates}")
 
 
+# Reading calibration alert rates from current and earlier evaluation artifacts
+def get_calibration_alert_rate(record: dict) -> float:
+    current_key = (
+        "calibration_normal_state_flight_alert_rate"
+    )
+
+    legacy_key = (
+        "calibration_normal_flight_alert_rate"
+    )
+
+    if current_key in record:
+        return float(record[current_key])
+
+    if legacy_key in record:
+        return float(record[legacy_key])
+
+    raise RuntimeError("Threshold record does not contain a recognized calibration alert-rate field.")
+
+
 # Collecting every distinct calibration alert rate represented by stored thresholds
 def build_achievable_alert_rates(run_evaluations: list[tuple[str, str, dict]]) -> list[float]:
     achievable_alert_rates = {
-        float(
-            record[
-                "calibration_normal_flight_alert_rate"
-            ]
-        )
+        get_calibration_alert_rate(record)
         for _, _, evaluation_metrics in run_evaluations
         for record in evaluation_metrics[
             "online_detection_threshold_metrics"
         ]
-        if float(
-            record[
-                "calibration_normal_flight_alert_rate"
-            ]
-        ) < 1.0
+        if get_calibration_alert_rate(record) < 1.0
     }
 
     if not achievable_alert_rates:
@@ -113,15 +125,14 @@ def load_run_evaluation(client: MlflowClient, run_id: str) -> tuple[str, dict]:
     return feature_set, evaluation_metrics
 
 
-# Selecting the most sensitive threshold within one calibration alert budget
-def select_fold_operating_record(fold_records: list[dict], target_alert_rate: float) -> dict:
+# Selecting the most sensitive threshold within one calibration budget
+def select_fold_operating_record(fold_records: list[dict], target_alert_rate: float
+) -> dict:
     eligible_records = [
         record
         for record in fold_records
         if (
-            record[
-                "calibration_normal_flight_alert_rate"
-            ]
+            get_calibration_alert_rate(record)
             <= target_alert_rate + 1e-12
         )
     ]
@@ -166,7 +177,7 @@ def calculate_weighted_average(records: list[dict], value_name: str, weight_name
 
 
 # Summarizing held-out behavior for one model and one alert budget
-def build_operating_point_summary(run_id: str, feature_set: str,
+def build_operating_point_summary(run_id: str, feature_set: str, 
                                   evaluation_metrics: dict, target_alert_rate: float
 ) -> dict:
     threshold_records = evaluation_metrics[
@@ -202,21 +213,12 @@ def build_operating_point_summary(run_id: str, feature_set: str,
     )
 
     normal_false_alert_count = sum(
-        int(
-            record[
-                "normal_flight_false_alert_count"
-            ]
-        )
+        int(record["normal_flight_false_alert_count"])
         for record in selected_records
     )
 
     fault_flight_count = sum(
         int(record["fault_flight_count"])
-        for record in selected_records
-    )
-
-    fault_any_alert_count = sum(
-        int(record["fault_flight_any_alert_count"])
         for record in selected_records
     )
 
@@ -226,21 +228,24 @@ def build_operating_point_summary(run_id: str, feature_set: str,
     )
 
     pre_signal_evaluation_count = sum(
-        int(
-            record[
-                "pre_observed_signal_evaluation_count"
-            ]
-        )
+        int(record["pre_observed_signal_evaluation_count"])
         for record in selected_records
     )
 
     pre_signal_alert_count = sum(
-        int(
-            record[
-                "pre_observed_signal_alert_count"
-            ]
-        )
+        int(record["pre_observed_signal_alert_count"])
         for record in selected_records
+    )
+
+    # Combining every held-out period known to represent normal operation
+    normal_state_flight_period_count = (
+        normal_flight_count
+        + pre_signal_evaluation_count
+    )
+
+    normal_state_false_alert_count = (
+        normal_false_alert_count
+        + pre_signal_alert_count
     )
 
     return {
@@ -250,19 +255,11 @@ def build_operating_point_summary(run_id: str, feature_set: str,
             target_alert_rate
         ),
         "selected_calibration_alert_rate_minimum": min(
-            float(
-                record[
-                    "calibration_normal_flight_alert_rate"
-                ]
-            )
+            get_calibration_alert_rate(record)
             for record in selected_records
         ),
         "selected_calibration_alert_rate_maximum": max(
-            float(
-                record[
-                    "calibration_normal_flight_alert_rate"
-                ]
-            )
+            get_calibration_alert_rate(record)
             for record in selected_records
         ),
         "threshold_minimum": min(
@@ -273,21 +270,13 @@ def build_operating_point_summary(run_id: str, feature_set: str,
             float(record["threshold"])
             for record in selected_records
         ),
-        "normal_false_alerts": (
-            f"{normal_false_alert_count}/"
-            f"{normal_flight_count}"
+        "normal_state_false_alerts": (
+            f"{normal_state_false_alert_count}/"
+            f"{normal_state_flight_period_count}"
         ),
-        "held_out_normal_false_alert_rate": (
-            normal_false_alert_count
-            / normal_flight_count
-        ),
-        "fault_flights_alerted": (
-            f"{fault_any_alert_count}/"
-            f"{fault_flight_count}"
-        ),
-        "held_out_fault_any_alert_rate": (
-            fault_any_alert_count
-            / fault_flight_count
+        "held_out_normal_state_false_alert_rate": (
+            normal_state_false_alert_count
+            / normal_state_flight_period_count
         ),
         "fault_flights_detected_after_signal": (
             f"{fault_post_signal_detection_count}/"
@@ -297,31 +286,31 @@ def build_operating_point_summary(run_id: str, feature_set: str,
             fault_post_signal_detection_count
             / fault_flight_count
         ),
-        "fault_flights_alerted_before_signal": (
+        "pre_fault_false_alerts": (
             f"{pre_signal_alert_count}/"
             f"{pre_signal_evaluation_count}"
         ),
-        "held_out_pre_signal_alert_rate": (
+        "held_out_pre_fault_false_alert_rate": (
             pre_signal_alert_count
             / pre_signal_evaluation_count
             if pre_signal_evaluation_count > 0
             else None
         ),
-        "mean_first_alert_signed_delay_seconds": (
+        "mean_post_fault_detection_delay_seconds": (
             calculate_weighted_average(
                 records = selected_records,
                 value_name = (
-                    "mean_first_alert_signed_delay_seconds"
+                    "mean_post_observed_signal_detection_delay_seconds"
                 ),
                 weight_name = (
-                    "fault_flight_any_alert_count"
+                    "fault_flight_detection_count"
                 )
             )
         )
     }
 
 
-# Comparing stored threshold behavior across runs and alert budgets
+# Comparing held-out operating points across MLflow runs
 def main() -> None:
     args = parse_args()
 
@@ -399,8 +388,8 @@ def main() -> None:
     ).sort_values(
         [
             "target_calibration_alert_rate",
-            "held_out_normal_false_alert_rate",
-            "held_out_fault_any_alert_rate"
+            "held_out_normal_state_false_alert_rate",
+            "held_out_post_signal_detection_rate"
         ],
         ascending = [
             True,
