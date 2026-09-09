@@ -21,8 +21,8 @@ from sklearn.preprocessing import RobustScaler
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CURATED_ROOT = PROJECT_ROOT / "data" / "alfa" / "curated"
 
-WINDOW_DATASET_PATH = CURATED_ROOT / "telemetry_windows.parquet"
-WINDOW_MANIFEST_PATH = CURATED_ROOT / "telemetry_windows_manifest.json"
+WINDOW_DATASET_PATH = CURATED_ROOT / "telemetry_windows_v3.parquet"
+WINDOW_MANIFEST_PATH = CURATED_ROOT / "telemetry_windows_v3_manifest.json"
 TRACKING_DATABASE_PATH = PROJECT_ROOT / "mlflow.db"
 
 METADATA_COLUMNS = {
@@ -36,6 +36,7 @@ METADATA_COLUMNS = {
 
 RANDOM_STATE = 42
 
+# Comparing two normal-behavior models under the same training and evaluation setup
 MODEL_CONFIGURATIONS = [
     {
         "name": "isolation_forest",
@@ -49,6 +50,7 @@ MODEL_CONFIGURATIONS = [
 ]
 
 
+# Returning anomaly scores where larger values indicate more unusual behavior
 class AnomalyScoreEstimator(BaseEstimator):
     def __init__(self, model_type: str, explained_variance: float = 0.95) -> None:
         self.model_type = model_type
@@ -68,7 +70,7 @@ class AnomalyScoreEstimator(BaseEstimator):
             )
 
         else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+            raise ValueError(f"Unsupported model type : {self.model_type}")
 
         self.detector_.fit(features)
 
@@ -117,7 +119,7 @@ def ensure_inputs_exist() -> None:
 
     if missing_paths:
         missing_text = "\n".join(str(path) for path in missing_paths)
-        raise FileNotFoundError(f"Required input paths not found:\n{missing_text}")
+        raise FileNotFoundError(f"Required input paths not found : \n{missing_text}")
 
 
 def load_window_dataset() -> tuple[pd.DataFrame, dict, list[str]]:
@@ -149,20 +151,29 @@ def validate_window_dataset(window_dataset: pd.DataFrame, feature_columns: list[
 
     if missing_columns:
         raise RuntimeError(
-            f"Telemetry window dataset is missing columns: {sorted(missing_columns)}"
+            f"Telemetry window dataset is missing columns : {sorted(missing_columns)}"
         )
 
-    allowed_labels = {"normal", "fault_state", "unlabeled"}
+    # Accepting all labels produced by the V3 window dataset
+    allowed_labels = {
+        "normal",
+        "pre_fault_state",
+        "fault_state",
+        "unlabeled"
+    }
 
     unexpected_labels = set(window_dataset["window_label"]) - allowed_labels
 
     if unexpected_labels:
         raise RuntimeError(
-            f"Unexpected window labels found: {sorted(unexpected_labels)}"
+            f"Unexpected window labels found : {sorted(unexpected_labels)}"
         )
     
+    # Including confirmed pre-fault periods when validating labeled features
     labelled_windows = window_dataset.loc[
-        window_dataset["window_label"].isin(["normal", "fault_state"])
+        window_dataset["window_label"].isin(
+            ["normal", "pre_fault_state", "fault_state"]
+        )
     ]
 
     if labelled_windows.empty:
@@ -205,6 +216,7 @@ def validate_window_dataset(window_dataset: pd.DataFrame, feature_columns: list[
         raise RuntimeError("No fault-state flights are available for evaluation.")
 
 
+# Fitting feature filtering, scaling and the anomaly model on normal-state training data
 def build_anomaly_pipeline(model_configuration: dict) -> Pipeline:
     return Pipeline(
         steps = [
@@ -224,68 +236,79 @@ def build_anomaly_pipeline(model_configuration: dict) -> Pipeline:
     )
 
 
+# Evaluating normal and fault windows from a completely held-out recording date
 def evaluate_leave_one_normal_flight_out(normal_windows: pd.DataFrame, fault_state_windows: pd.DataFrame,
                                          feature_columns: list[str], model_configuration: dict
 ) -> list[dict]:
-    normal_features = normal_windows[feature_columns]
-    normal_groups = normal_windows["flight_name"].to_numpy()
+    date_pattern = r"^carbonZ_(\d{4}-\d{2}-\d{2})-"
 
-    fault_windows_by_flight = {
-        flight_name: flight_windows
-        for flight_name, flight_windows in fault_state_windows.groupby(
-            "flight_name",
-            sort = True
-        )
-    }
+    normal_dates = normal_windows["flight_name"].str.extract(
+        date_pattern,
+        expand = False
+    )
 
-    splitter = LeaveOneGroupOut()
+    fault_dates = fault_state_windows["flight_name"].str.extract(
+        date_pattern,
+        expand = False
+    )
+
+    if normal_dates.isna().any() or fault_dates.isna().any():
+        raise RuntimeError("Recording dates could not be extracted.")
+
+    if normal_dates.nunique() < 2:
+        raise RuntimeError("At least two normal-state recording dates are required.")
+
+    if not set(fault_dates).issubset(set(normal_dates)):
+        raise RuntimeError("A fault recording date has no normal-state evaluation data.")
+
     evaluation_records = []
 
-    for training_indices, validation_indices in splitter.split(
-        normal_features,
-        groups = normal_groups
-    ):
+    for recording_date in sorted(normal_dates.unique()):
+        # Excluding the entire evaluation date from model and preprocessing fits
+        training_windows = normal_windows.loc[
+            normal_dates.ne(recording_date)
+        ]
+
+        validation_windows = normal_windows.loc[
+            normal_dates.eq(recording_date)
+        ]
+
+        test_fault_windows = fault_state_windows.loc[
+            fault_dates.eq(recording_date)
+        ]
+
+        if test_fault_windows.empty:
+            raise RuntimeError("A recording date has no fault-state evaluation windows.")
+
         pipeline = build_anomaly_pipeline(model_configuration)
+        pipeline.fit(training_windows[feature_columns])
 
-        pipeline.fit(normal_features.iloc[training_indices])
+        # Each pair contains only flights from the held-out date
+        for normal_flight, normal_frame in validation_windows.groupby("flight_name"):
+            normal_scores = pipeline.predict(normal_frame[feature_columns])
 
-        normal_scores = pipeline.predict(
-            normal_features.iloc[validation_indices]
-        )
+            for fault_flight, fault_frame in test_fault_windows.groupby("flight_name"):
+                fault_scores = pipeline.predict(fault_frame[feature_columns])
 
-        held_out_normal_flight = str(normal_groups[validation_indices][0])
-
-        for fault_flight, fault_windows in fault_windows_by_flight.items():
-            fault_scores = pipeline.predict(
-                fault_windows[feature_columns]
-            )
-
-            evaluation_labels = np.concatenate(
-                [
-                    np.zeros(len(normal_scores), dtype = int),
-                    np.ones(len(fault_scores), dtype = int)
-                ]
-            )
-
-            evaluation_scores = np.concatenate(
-                [normal_scores, fault_scores]
-            )
-
-            evaluation_records.append(
-                {
-                    "held_out_normal_flight": held_out_normal_flight,
-                    "fault_state_flight": fault_flight,
-                    "normal_window_count": int(len(normal_scores)),
-                    "fault_state_window_count": int(len(fault_scores)),
-                    "roc_auc": float(
-                        roc_auc_score(evaluation_labels, evaluation_scores)
-                    ),
-                    "normal_score_median": float(np.median(normal_scores)),
-                    "fault_state_score_median": float(
-                        np.median(fault_scores)
-                    )
-                }
-            )
+                evaluation_records.append(
+                    {
+                        "held_out_recording_date": str(recording_date),
+                        "held_out_normal_flight": str(normal_flight),
+                        "fault_state_flight": str(fault_flight),
+                        "normal_window_count": int(len(normal_scores)),
+                        "fault_state_window_count": int(len(fault_scores)),
+                        "roc_auc": float(
+                            roc_auc_score(
+                                np.concatenate(
+                                    [np.zeros(len(normal_scores)), np.ones(len(fault_scores))]
+                                ),
+                                np.concatenate([normal_scores, fault_scores])
+                            )
+                        ),
+                        "normal_score_median": float(np.median(normal_scores)),
+                        "fault_state_score_median": float(np.median(fault_scores))
+                    }
+                )
 
     return evaluation_records
 
@@ -402,8 +425,12 @@ def main() -> None:
         feature_columns = feature_columns
     )
 
+    # Learning normal behavior from healthy flights and confirmed pre-fault
+    # periods; fault-state and transition windows are excluded from fitting.
     normal_windows = window_dataset.loc[
-        window_dataset["window_label"].eq("normal")
+        window_dataset["window_label"].isin(
+            ["normal", "pre_fault_state"]
+        )
     ].copy()
 
     fault_state_windows = window_dataset.loc[
@@ -421,7 +448,7 @@ def main() -> None:
             }
         )
 
-        mlflow.log_dict(manifest, "telemetry_windows_manifest.json")
+        mlflow.log_dict(manifest, "telemetry_windows_v3_manifest.json")
 
         model_results = []
 
