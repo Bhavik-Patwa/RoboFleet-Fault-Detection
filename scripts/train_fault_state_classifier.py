@@ -9,32 +9,24 @@ import mlflow
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from lightgbm import LGBMClassifier
 from mlflow.models import infer_signature
 from sklearn.feature_selection import VarianceThreshold
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CURATED_ROOT = PROJECT_ROOT / "data" / "alfa" / "curated"
 METADATA_ROOT = PROJECT_ROOT / "data" / "alfa" / "metadata"
 
-WINDOW_DATASET_PATH = (
-    CURATED_ROOT / "telemetry_windows_v2.parquet"
-)
+WINDOW_DATASET_PATH = CURATED_ROOT / "telemetry_windows_v3.parquet"
+WINDOW_MANIFEST_PATH = CURATED_ROOT / "telemetry_windows_v3_manifest.json"
 
-WINDOW_MANIFEST_PATH = (
-    CURATED_ROOT / "telemetry_windows_v2_manifest.json"
-)
-
-TRAINING_FLIGHT_REFERENCE_PATH = (
-    METADATA_ROOT / "training_flight_reference.csv"
-)
-
+TRAINING_FLIGHT_REFERENCE_PATH = (METADATA_ROOT / "training_flight_reference.csv")
 TRACKING_DATABASE_PATH = PROJECT_ROOT / "mlflow.db"
 
 METADATA_COLUMNS = {
@@ -47,12 +39,9 @@ METADATA_COLUMNS = {
 }
 
 RANDOM_STATE = 42
-RECORDING_DATE_PATTERN = (
-    r"^carbonZ_(\d{4}-\d{2}-\d{2})-"
-)
+RECORDING_DATE_PATTERN = r"^carbonZ_(\d{4}-\d{2}-\d{2})-"
 
-
-# Defining multiple hyperparameter configurations for model comparison
+# Defining multiple hyperparameter configurations for model selection
 MODEL_CONFIGURATIONS = [
     {
         "name": "logistic_regression_l2_c0p01",
@@ -73,10 +62,7 @@ MODEL_CONFIGURATIONS = [
         "model_complexity": 0
     },
     {
-        "name": (
-            "lgbm_n200_lr0p03_leaves7_"
-            "minchild20_l2_1_colsample0p8"
-        ),
+        "name": "lgbm_n200_lr0p03_leaves7_minchild20_l2_1_colsample0p8",
         "model_type": "lightgbm",
         "model_complexity": 1,
         "n_estimators": 200,
@@ -87,10 +73,7 @@ MODEL_CONFIGURATIONS = [
         "colsample_bytree": 0.8
     },
     {
-        "name": (
-            "lgbm_n300_lr0p03_leaves7_"
-            "minchild30_l2_5_colsample0p8"
-        ),
+        "name": "lgbm_n300_lr0p03_leaves7_minchild30_l2_5_colsample0p8",
         "model_type": "lightgbm",
         "model_complexity": 1,
         "n_estimators": 300,
@@ -101,10 +84,7 @@ MODEL_CONFIGURATIONS = [
         "colsample_bytree": 0.8
     },
     {
-        "name": (
-            "lgbm_n200_lr0p05_leaves15_"
-            "minchild20_l2_5_colsample0p8"
-        ),
+        "name": "lgbm_n200_lr0p05_leaves15_minchild20_l2_5_colsample0p8",
         "model_type": "lightgbm",
         "model_complexity": 1,
         "n_estimators": 200,
@@ -115,10 +95,7 @@ MODEL_CONFIGURATIONS = [
         "colsample_bytree": 0.8
     },
     {
-        "name": (
-            "lgbm_n400_lr0p02_leaves15_"
-            "minchild30_l2_10_colsample0p8"
-        ),
+        "name": "lgbm_n400_lr0p02_leaves15_minchild30_l2_10_colsample0p8",
         "model_type": "lightgbm",
         "model_complexity": 1,
         "n_estimators": 400,
@@ -133,8 +110,7 @@ MODEL_CONFIGURATIONS = [
 
 # Fixing the primary model so feature-set comparisons measure representation changes
 PRIMARY_MODEL_CONFIGURATION_NAME = (
-    "lgbm_n200_lr0p03_leaves7_"
-    "minchild20_l2_1_colsample0p8"
+    "lgbm_n200_lr0p03_leaves7_minchild20_l2_1_colsample0p8"
 )
 
 
@@ -158,9 +134,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--experiment-name",
-        default = (
-            "telemetry_fault_state_classification"
-        )
+        default = "telemetry_fault_state_classification"
     )
 
     parser.add_argument(
@@ -216,7 +190,7 @@ def ensure_inputs_exist() -> None:
         raise FileNotFoundError(f"Required input paths not found : \n{missing_text}")
 
 
-# Computing the SHA256 digest of one input file
+# Computing SHA256 hash of a file for data integrity tracking
 def calculate_file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
 
@@ -232,13 +206,11 @@ def calculate_file_sha256(path: Path) -> str:
 
 # Extracting the recording date used as a conservative evaluation group
 def extract_recording_dates(flight_names: pd.Series) -> pd.Series:
-    recording_dates = (
-        flight_names
-        .astype(str)
-        .str.extract(
-            RECORDING_DATE_PATTERN,
-            expand = False
-        )
+    recording_dates = flight_names.astype(
+        str
+    ).str.extract(
+        RECORDING_DATE_PATTERN,
+        expand = False
     )
 
     if recording_dates.isna().any():
@@ -255,24 +227,29 @@ def extract_recording_dates(flight_names: pd.Series) -> pd.Series:
     return recording_dates
 
 
-# Extracting one label and one evaluation group for each flight
+# Extracting one fault-flight label and one evaluation group for each flight
 def build_flight_labels(labeled_windows: pd.DataFrame) -> pd.DataFrame:
     flight_labels = (
-        labeled_windows[
-            [
-                "flight_name",
-                "target"
-            ]
-        ]
-        .drop_duplicates()
+        labeled_windows
+        .groupby(
+            "flight_name",
+            as_index = False
+        )
+        .agg(
+            # A flight is a fault flight when it contains fault-state windows
+            target = (
+                "target",
+                "max"
+            )
+        )
         .sort_values("flight_name")
         .reset_index(drop = True)
     )
 
-    if flight_labels[
-        "flight_name"
-    ].duplicated().any():
-        raise RuntimeError("A flight has conflicting fault-state labels.")
+    if not set(
+        flight_labels["target"]
+    ).issubset({0, 1}):
+        raise RuntimeError("Flight targets contain values outside binary classification.")
 
     flight_labels["recording_date"] = (
         extract_recording_dates(
@@ -286,9 +263,7 @@ def build_flight_labels(labeled_windows: pd.DataFrame) -> pd.DataFrame:
 # Building leave-one-recording-date-out splits and validating every partition
 def build_recording_date_splits(flight_labels: pd.DataFrame) -> list[tuple[np.ndarray, np.ndarray]]:
     recording_date_count = int(
-        flight_labels[
-            "recording_date"
-        ].nunique()
+        flight_labels["recording_date"].nunique()
     )
 
     if recording_date_count < 2:
@@ -306,10 +281,7 @@ def build_recording_date_splits(flight_labels: pd.DataFrame) -> list[tuple[np.nd
         )
     )
 
-    for (
-        training_indices,
-        test_indices
-    ) in grouped_splits:
+    for training_indices, test_indices in grouped_splits:
         training_labels = flight_labels.iloc[
             training_indices
         ]
@@ -327,14 +299,10 @@ def build_recording_date_splits(flight_labels: pd.DataFrame) -> list[tuple[np.nd
         if len(held_out_recording_dates) != 1:
             raise RuntimeError("A test fold contains more than one recording date.")
 
-        if training_labels[
-            "target"
-        ].nunique() != 2:
+        if training_labels["target"].nunique() != 2:
             raise RuntimeError("A grouped training fold does not contain both classes.")
 
-        if test_labels[
-            "target"
-        ].nunique() != 2:
+        if test_labels["target"].nunique() != 2:
             raise RuntimeError("A grouped test fold does not contain both classes.")
 
     return grouped_splits
@@ -388,8 +356,7 @@ def select_feature_set(all_feature_columns: list[str], feature_set: str) -> list
     command_response_feature_columns = [
         column_name
         for column_name in all_feature_columns
-        if command_response_marker
-        in column_name
+        if command_response_marker in column_name
     ]
 
     # Excluding command-response derivatives so ablation groups remain separate
@@ -462,8 +429,7 @@ def select_feature_set(all_feature_columns: list[str], feature_set: str) -> list
         "relative_dynamic": [
             column_name
             for column_name in all_feature_columns
-            if column_name
-            in relative_dynamic_names
+            if column_name in relative_dynamic_names
         ],
         "combined": all_feature_columns
     }
@@ -484,10 +450,10 @@ def select_feature_set(all_feature_columns: list[str], feature_set: str) -> list
 # Loading and preparing training data from parquet, manifest and flight reference
 def load_training_data(feature_set: str
 ) -> tuple[
-    pd.DataFrame, 
-    pd.DataFrame, 
-    pd.DataFrame, 
-    dict, 
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict,
     list[str]
 ]:
     window_dataset = pd.read_parquet(
@@ -505,16 +471,12 @@ def load_training_data(feature_set: str
     # Identifying feature columns by excluding metadata columns
     all_feature_columns = [
         column_name
-        for column_name
-        in window_dataset.columns
-        if column_name
-        not in METADATA_COLUMNS
+        for column_name in window_dataset.columns
+        if column_name not in METADATA_COLUMNS
     ]
 
     feature_columns = select_feature_set(
-        all_feature_columns = (
-            all_feature_columns
-        ),
+        all_feature_columns = all_feature_columns,
         feature_set = feature_set
     )
 
@@ -531,13 +493,12 @@ def load_training_data(feature_set: str
     ]:
         raise RuntimeError("Total feature column count does not match the manifest.")
 
-    # Filtering only labeled windows for supervised learning
+    # Using confirmed normal, pre-fault and post-fault windows for training
     labeled_windows = window_dataset.loc[
-        window_dataset[
-            "window_label"
-        ].isin(
+        window_dataset["window_label"].isin(
             [
                 "normal",
+                "pre_fault_state",
                 "fault_state"
             ]
         )
@@ -546,11 +507,9 @@ def load_training_data(feature_set: str
     if labeled_windows.empty:
         raise RuntimeError("No labeled telemetry windows are available.")
 
-    # Creating the binary fault-state target from window labels
+    # Creating binary target column from window labels
     labeled_windows["target"] = (
-        labeled_windows[
-            "window_label"
-        ]
+        labeled_windows["window_label"]
         .eq("fault_state")
         .astype(int)
     )
@@ -564,8 +523,8 @@ def load_training_data(feature_set: str
     )
 
 
-# Validating training data integrity and grouped-evaluation suitability
-def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame, 
+# Comprehensive validation of training data integrity and suitability
+def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
                            flight_reference: pd.DataFrame, feature_columns: list[str]
 ) -> None:
     required_columns = (
@@ -574,15 +533,12 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
         )
     )
 
-    missing_columns = (
-        required_columns.difference(
-            window_dataset.columns
-        )
+    missing_columns = required_columns.difference(
+        window_dataset.columns
     )
 
     if missing_columns:
-        raise RuntimeError(f"Telemetry window dataset is missing columns : {sorted(missing_columns)}"
-        )
+        raise RuntimeError(f"Telemetry window dataset is missing columns : {sorted(missing_columns)}")
 
     required_flight_columns = {
         "flight_name",
@@ -605,9 +561,7 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
 
     feature_values = window_dataset[
         feature_columns
-    ].to_numpy(
-        dtype = "float64"
-    )
+    ].to_numpy(dtype = "float64")
 
     if not np.isfinite(
         feature_values
@@ -676,7 +630,7 @@ def validate_training_data(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     )
 
 
-# Building the classification pipeline for one declared configuration
+# Building the classification pipeline with specified model configuration
 def build_classifier(model_configuration: dict) -> Pipeline:
     steps = [
         (
@@ -760,9 +714,7 @@ def build_classifier(model_configuration: dict) -> Pipeline:
     else:
         raise ValueError(f"Unsupported model type : {model_configuration['model_type']}")
 
-    return Pipeline(
-        steps = steps
-    )
+    return Pipeline(steps = steps)
 
 
 # Giving each class equal total weight and each flight within a class equal influence
@@ -784,7 +736,8 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
         )
     )
 
-    # Giving each target class equal total training influence
+    # Each class receives total weight of one, preventing fault flights from
+    # outweighing normal flights simply because there are more of them.
     flight_window_counts[
         "class_flight_count"
     ] = (
@@ -804,7 +757,7 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
         ]
     )
 
-    # Sharing each flight's total weight across its overlapping windows
+    # A flight's total weight is shared across its overlapping windows.
     flight_window_counts[
         "sample_weight"
     ] = (
@@ -821,8 +774,7 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
             int(row.target),
             str(row.flight_name)
         ): float(row.sample_weight)
-        for row
-        in flight_window_counts.itertuples(
+        for row in flight_window_counts.itertuples(
             index = False
         )
     }
@@ -840,9 +792,7 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
                     "target",
                     "flight_name"
                 ]
-            ].itertuples(
-                index = False
-            )
+            ].itertuples(index = False)
         ],
         dtype = "float64"
     )
@@ -859,7 +809,7 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
     if total_weight <= 0.0:
         raise RuntimeError("Training sample weights must have a positive total.")
 
-    # Preserving relative balancing while keeping the mean weight at one
+    # Preserving relative class and flight balancing while keeping mean weight at one
     sample_weights *= (
         len(sample_weights)
         / total_weight
@@ -868,7 +818,7 @@ def calculate_flight_balanced_sample_weights(training_windows: pd.DataFrame) -> 
     return sample_weights
 
 
-# Fitting either logistic regression or LightGBM with identical weights
+# Fitting either logistic regression or LightGBM with identical flight-balanced weights
 def fit_classifier(classifier: Pipeline, training_windows: pd.DataFrame, feature_columns: list[str]) -> Pipeline:
     sample_weights = (
         calculate_flight_balanced_sample_weights(
@@ -889,25 +839,48 @@ def fit_classifier(classifier: Pipeline, training_windows: pd.DataFrame, feature
     return classifier
 
 
-# Aggregating window predictions into one score for each flight
+# Aggregating comparable normal and post-fault predictions by flight
 def build_flight_prediction_frame(windows: pd.DataFrame, probabilities: np.ndarray) -> pd.DataFrame:
-    flight_predictions = (
-        pd.DataFrame(
-            {
-                "flight_name": windows[
-                    "flight_name"
-                ].to_numpy(),
-                "fault_family_label": windows[
-                    "fault_family_label"
-                ].to_numpy(),
-                "target": windows[
-                    "target"
-                ].to_numpy(),
-                "fault_state_score": (
-                    probabilities
-                )
-            }
+    if len(windows) != len(probabilities):
+        raise RuntimeError(
+            "Window and probability counts do not match."
         )
+
+    prediction_windows = pd.DataFrame(
+        {
+            "flight_name": windows[
+                "flight_name"
+            ].to_numpy(),
+            "fault_family_label": windows[
+                "fault_family_label"
+            ].to_numpy(),
+            "window_label": windows[
+                "window_label"
+            ].to_numpy(),
+            "target": windows[
+                "target"
+            ].to_numpy(),
+            "fault_state_score": probabilities
+        }
+    )
+
+    # Pre-fault windows are training negatives but are excluded here so the
+    # original normal-flight versus post-fault comparison remains meaningful.
+    flight_evaluation_windows = (
+        prediction_windows.loc[
+            prediction_windows[
+                "window_label"
+            ].isin(
+                [
+                    "normal",
+                    "fault_state"
+                ]
+            )
+        ]
+    )
+
+    flight_predictions = (
+        flight_evaluation_windows
         .groupby(
             [
                 "flight_name",
@@ -930,6 +903,11 @@ def build_flight_prediction_frame(windows: pd.DataFrame, probabilities: np.ndarr
             )
         )
     )
+
+    if flight_predictions[
+        "flight_name"
+    ].duplicated().any():
+        raise RuntimeError("Flight-level evaluation produced duplicate flights.")
 
     return flight_predictions
 
@@ -960,21 +938,17 @@ def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_wind
 ) -> list[dict]:
     benchmark_records = []
 
-    for (
-        model_configuration
-    ) in MODEL_CONFIGURATIONS:
+    for model_configuration in (
+        MODEL_CONFIGURATIONS
+    ):
         classifier = build_classifier(
             model_configuration
         )
 
         classifier = fit_classifier(
             classifier = classifier,
-            training_windows = (
-                training_windows
-            ),
-            feature_columns = (
-                feature_columns
-            )
+            training_windows = training_windows,
+            feature_columns = feature_columns
         )
 
         test_probabilities = (
@@ -992,9 +966,7 @@ def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_wind
                     held_out_recording_date
                 ),
                 "model_configuration_name": (
-                    model_configuration[
-                        "name"
-                    ]
+                    model_configuration["name"]
                 ),
                 "model_type": (
                     model_configuration[
@@ -1003,9 +975,7 @@ def benchmark_candidates_on_outer_fold(training_windows: pd.DataFrame, test_wind
                 ),
                 "window_roc_auc": float(
                     roc_auc_score(
-                        test_windows[
-                            "target"
-                        ],
+                        test_windows["target"],
                         test_probabilities
                     )
                 ),
@@ -1070,9 +1040,7 @@ def build_window_prediction_records(scored_windows: pd.DataFrame, fold_number: i
                 "window_label",
                 "fault_probability"
             ]
-        ].itertuples(
-            index = False
-        )
+        ].itertuples(index = False)
     ]
 
 
@@ -1083,7 +1051,7 @@ def get_primary_model_configuration() -> dict:
     )
 
 
-# Generating calibration predictions from normal windows using inner validation
+# Generating calibration predictions from all confirmed normal-state periods
 def collect_calibration_predictions(training_windows: pd.DataFrame, feature_columns: list[str],
                                     model_configuration: dict
 ) -> pd.DataFrame:
@@ -1091,15 +1059,13 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
         training_windows
     )
 
-    grouped_splits = (
-        build_recording_date_splits(
-            flight_labels
-        )
+    grouped_splits = build_recording_date_splits(
+        flight_labels
     )
 
     calibration_frames = []
 
-    # Producing held-out normal-window predictions for each recording date
+    # Producing held-out normal-state predictions for every training flight
     for (
         training_indices,
         validation_indices
@@ -1126,7 +1092,9 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
             ]
         )
 
-        inner_validation_normal_windows = (
+        # Both no-failure and confirmed pre-fault periods represent normal
+        # operation for false-alert threshold calibration.
+        inner_validation_normal_state_windows = (
             training_windows.loc[
                 training_windows[
                     "flight_name"
@@ -1134,10 +1102,20 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
                     inner_validation_flights
                 )
                 & training_windows[
-                    "target"
-                ].eq(0)
+                    "window_label"
+                ].isin(
+                    [
+                        "normal",
+                        "pre_fault_state"
+                    ]
+                )
             ]
         )
+
+        if (
+            inner_validation_normal_state_windows.empty
+        ):
+            raise RuntimeError("An inner validation fold does not contain normal-state windows.")
 
         classifier = build_classifier(
             model_configuration
@@ -1148,22 +1126,20 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
             training_windows = (
                 inner_training_windows
             ),
-            feature_columns = (
-                feature_columns
-            )
+            feature_columns = feature_columns
         )
 
         calibration_frames.append(
             pd.DataFrame(
                 {
                     "flight_name": (
-                        inner_validation_normal_windows[
+                        inner_validation_normal_state_windows[
                             "flight_name"
                         ].to_numpy()
                     ),
                     "fault_probability": (
                         classifier.predict_proba(
-                            inner_validation_normal_windows[
+                            inner_validation_normal_state_windows[
                                 feature_columns
                             ]
                         )[:, 1]
@@ -1177,11 +1153,16 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
         ignore_index = True
     )
 
-    expected_normal_flight_count = int(
-        flight_labels.loc[
-            flight_labels[
-                "target"
-            ].eq(0),
+    expected_normal_state_flight_count = int(
+        training_windows.loc[
+            training_windows[
+                "window_label"
+            ].isin(
+                [
+                    "normal",
+                    "pre_fault_state"
+                ]
+            ),
             "flight_name"
         ].nunique()
     )
@@ -1190,9 +1171,9 @@ def collect_calibration_predictions(training_windows: pd.DataFrame, feature_colu
         calibration_predictions[
             "flight_name"
         ].nunique()
-        != expected_normal_flight_count
+        != expected_normal_state_flight_count
     ):
-        raise RuntimeError("Calibration predictions do not cover every normal training flight.")
+        raise RuntimeError("Calibration predictions do not cover every normal-state flight.")
 
     return calibration_predictions
 
@@ -1262,24 +1243,20 @@ def select_operating_threshold(calibration_predictions: pd.DataFrame, target_ale
 
 # Evaluating online detection performance across all thresholds
 def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.DataFrame,
-                              failure_times: pd.Series, thresholds: np.ndarray,
+                              failure_times: pd.Series, thresholds: np.ndarray, 
                               calibration_predictions: pd.DataFrame, fold_number: int,
                               held_out_recording_date: str, model_configuration_name: str
 ) -> list[dict]:
     normal_flights = set(
         flight_labels.loc[
-            flight_labels[
-                "target"
-            ].eq(0),
+            flight_labels["target"].eq(0),
             "flight_name"
         ]
     )
 
     fault_flights = set(
         flight_labels.loc[
-            flight_labels[
-                "target"
-            ].eq(1),
+            flight_labels["target"].eq(1),
             "flight_name"
         ]
     )
@@ -1309,7 +1286,6 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
         fault_flight_any_alert_count = 0
         first_alert_signed_delays = []
 
-        # Counting normal flights with any alert above the threshold
         for flight_name in normal_flights:
             flight_windows = (
                 scored_windows.loc[
@@ -1324,7 +1300,6 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
             ].ge(threshold).any():
                 normal_false_alert_count += 1
 
-        # Evaluating fault-flight detection and premature alerts
         for flight_name in fault_flights:
             flight_windows = (
                 scored_windows.loc[
@@ -1332,9 +1307,7 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                         "flight_name"
                     ].eq(flight_name)
                 ]
-                .sort_values(
-                    "window_end_ns"
-                )
+                .sort_values("window_end_ns")
             )
 
             failure_time_ns = int(
@@ -1347,7 +1320,6 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                 )
             )
 
-            # Finding the first alert anywhere in the fault flight
             all_detection_windows = (
                 flight_windows.loc[
                     flight_windows[
@@ -1373,13 +1345,13 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
 
                 fault_flight_any_alert_count += 1
 
-            # Evaluating alerts before the recorded failure-status signal
+            # Evaluating only windows confirmed to end before fault activation
             pre_observed_signal_windows = (
                 flight_windows.loc[
                     flight_windows[
-                        "window_end_ns"
-                    ].lt(
-                        failure_time_ns
+                        "window_label"
+                    ].eq(
+                        "pre_fault_state"
                     )
                 ]
             )
@@ -1392,14 +1364,13 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                 ].ge(threshold).any():
                     pre_observed_signal_alert_count += 1
 
-            # Evaluating detections at or after the failure-status signal
+            # Requiring the window to finish after the failure-status signal
+            # because the window interval excludes its ending timestamp
             post_observed_signal_windows = (
                 flight_windows.loc[
                     flight_windows[
                         "window_end_ns"
-                    ].ge(
-                        failure_time_ns
-                    )
+                    ].gt(failure_time_ns)
                 ]
             )
 
@@ -1436,10 +1407,8 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                 "model_configuration_name": (
                     model_configuration_name
                 ),
-                "threshold": float(
-                    threshold
-                ),
-                "calibration_normal_flight_alert_rate": float(
+                "threshold": float(threshold),
+                "calibration_normal_state_flight_alert_rate": float(
                     np.mean(
                         normal_flight_scores[
                             "maximum_fault_probability"
@@ -1520,10 +1489,7 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
                         pre_observed_signal_alert_count
                         / pre_observed_signal_evaluation_count
                     )
-                    if (
-                        pre_observed_signal_evaluation_count
-                        > 0
-                    )
+                    if pre_observed_signal_evaluation_count > 0
                     else None
                 ),
                 "mean_post_observed_signal_detection_delay_seconds": (
@@ -1550,7 +1516,7 @@ def evaluate_online_detection(scored_windows: pd.DataFrame, flight_labels: pd.Da
     return threshold_records
 
 
-# Evaluating fixed models, thresholds and predictions across recording dates
+# Evaluating model selection, candidate benchmarks and held-out predictions
 def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.DataFrame,
                            flight_reference: pd.DataFrame, feature_columns: list[str],
                            target_normal_flight_alert_rate: float
@@ -1566,10 +1532,8 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
         labeled_windows
     )
 
-    grouped_splits = (
-        build_recording_date_splits(
-            flight_labels
-        )
+    grouped_splits = build_recording_date_splits(
+        flight_labels
     )
 
     failure_times = (
@@ -1615,9 +1579,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             labeled_windows.loc[
                 labeled_windows[
                     "flight_name"
-                ].isin(
-                    training_flights
-                )
+                ].isin(training_flights)
             ]
         )
 
@@ -1625,22 +1587,17 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             labeled_windows.loc[
                 labeled_windows[
                     "flight_name"
-                ].isin(
-                    test_flights
-                )
+                ].isin(test_flights)
             ]
         )
 
-        # Including unlabeled windows only for online alert evaluation
+        # Including transition-overlapping windows for online evaluation only
         test_windows = window_dataset.loc[
             window_dataset[
                 "flight_name"
-            ].isin(
-                test_flights
-            )
+            ].isin(test_flights)
         ].copy()
 
-        # Recording exploratory candidate comparisons on the held-out date
         candidate_benchmark_records.extend(
             benchmark_candidates_on_outer_fold(
                 training_windows = (
@@ -1669,12 +1626,8 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
 
         classifier = fit_classifier(
             classifier = classifier,
-            training_windows = (
-                training_windows
-            ),
-            feature_columns = (
-                feature_columns
-            )
+            training_windows = training_windows,
+            feature_columns = feature_columns
         )
 
         test_probabilities = (
@@ -1692,7 +1645,9 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
 
         flight_prediction_frame = (
             build_flight_prediction_frame(
-                windows = test_labeled_windows,
+                windows = (
+                    test_labeled_windows
+                ),
                 probabilities = (
                     test_probabilities
                 )
@@ -1706,7 +1661,6 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             ]
         )
 
-        # Recording one held-out prediction for every labeled flight
         for record in (
             flight_prediction_frame.to_dict(
                 orient = "records"
@@ -1729,19 +1683,14 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
 
         calibration_predictions = (
             collect_calibration_predictions(
-                training_windows = (
-                    training_windows
-                ),
-                feature_columns = (
-                    feature_columns
-                ),
+                training_windows = training_windows,
+                feature_columns = feature_columns,
                 model_configuration = (
                     selected_configuration
                 )
             )
         )
 
-        # Selecting this fold's threshold using only training-flight calibration
         operating_threshold = (
             select_operating_threshold(
                 calibration_predictions = (
@@ -1753,7 +1702,6 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             )
         )
 
-        # Scoring every window from held-out flights without retraining
         test_windows[
             "fault_probability"
         ] = classifier.predict_proba(
@@ -1764,9 +1712,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
 
         out_of_fold_window_prediction_records.extend(
             build_window_prediction_records(
-                scored_windows = (
-                    test_windows
-                ),
+                scored_windows = test_windows,
                 fold_number = fold_number,
                 held_out_recording_date = (
                     held_out_recording_date
@@ -1783,17 +1729,13 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             flight_labels.loc[
                 flight_labels[
                     "flight_name"
-                ].isin(
-                    test_flights
-                )
+                ].isin(test_flights)
             ]
         )
 
         fold_threshold_records = (
             evaluate_online_detection(
-                scored_windows = (
-                    test_windows
-                ),
+                scored_windows = test_windows,
                 flight_labels = (
                     test_flight_labels
                 ),
@@ -1831,9 +1773,10 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
             )
         ]
 
-        if len(
-            matching_operating_records
-        ) != 1:
+        if (
+            len(matching_operating_records)
+            != 1
+        ):
             raise RuntimeError("Exactly one calibrated operating threshold was expected.")
 
         operating_point_records.append(
@@ -1876,12 +1819,12 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
                 "flight_roc_auc": float(
                     flight_roc_auc
                 ),
-                "calibration_normal_flight_count": int(
+                "calibration_normal_state_flight_count": int(
                     calibration_predictions[
                         "flight_name"
                     ].nunique()
                 ),
-                "calibration_normal_window_count": int(
+                "calibration_normal_state_window_count": int(
                     len(
                         calibration_predictions
                     )
@@ -1902,7 +1845,7 @@ def evaluate_grouped_folds(window_dataset: pd.DataFrame, labeled_windows: pd.Dat
     )
 
 
-# Training, evaluating and logging one fault-state feature representation
+# Training, evaluating and recording one feature representation
 def main() -> None:
     args = parse_args()
 
@@ -1946,8 +1889,10 @@ def main() -> None:
         fold_records
     )
 
-    candidate_benchmark_metrics = pd.DataFrame(
-        candidate_benchmark_records
+    candidate_benchmark_metrics = (
+        pd.DataFrame(
+            candidate_benchmark_records
+        )
     )
 
     candidate_benchmark_summary = (
@@ -2005,13 +1950,13 @@ def main() -> None:
                 True
             ]
         )
-        .reset_index(
-            drop = True
-        )
+        .reset_index(drop = True)
     )
 
-    out_of_fold_flight_predictions = pd.DataFrame(
-        out_of_fold_flight_prediction_records
+    out_of_fold_flight_predictions = (
+        pd.DataFrame(
+            out_of_fold_flight_prediction_records
+        )
     )
 
     if out_of_fold_flight_predictions[
@@ -2081,12 +2026,9 @@ def main() -> None:
         .sort_values(
             "mean_fault_state_score"
         )
-        .reset_index(
-            drop = True
-        )
+        .reset_index(drop = True)
     )
 
-    # Confirming that the fixed primary model was evaluated in every outer fold
     outer_primary_model_evaluation_counts = (
         fold_metrics[
             "model_configuration_name"
@@ -2110,7 +2052,6 @@ def main() -> None:
         feature_columns = feature_columns
     )
 
-    # Deriving the full-training operating threshold from grouped predictions
     final_calibration_predictions = (
         collect_calibration_predictions(
             training_windows = (
@@ -2125,7 +2066,7 @@ def main() -> None:
         )
     )
 
-    final_operating_threshold = (
+    provisional_full_training_threshold = (
         select_operating_threshold(
             calibration_predictions = (
                 final_calibration_predictions
@@ -2157,9 +2098,7 @@ def main() -> None:
         input_example_probabilities
     )
 
-    mlflow.set_tracking_uri(
-        f"sqlite:///{TRACKING_DATABASE_PATH}"
-    )
+    mlflow.set_tracking_uri(f"sqlite:///{TRACKING_DATABASE_PATH}")
 
     mlflow.set_experiment(
         args.experiment_name
@@ -2183,38 +2122,54 @@ def main() -> None:
                 "recording_date_count": int(
                     build_flight_labels(
                         labeled_windows
-                    )[
-                        "recording_date"
-                    ].nunique()
+                    )["recording_date"].nunique()
                 ),
                 "final_model_configuration": (
                     final_configuration[
                         "name"
                     ]
                 ),
-                "source_topic_count": manifest[
-                    "source_topic_count"
-                ],
-                "source_column_count": manifest[
-                    "source_column_count"
-                ],
+                "source_topic_count": (
+                    manifest[
+                        "source_topic_count"
+                    ]
+                ),
+                "source_column_count": (
+                    manifest[
+                        "source_column_count"
+                    ]
+                ),
                 "window_feature_count": len(
                     feature_columns
                 ),
                 "retained_feature_count": (
                     retained_feature_count
                 ),
-                "window_duration_seconds": manifest[
-                    "window_duration_seconds"
-                ],
-                "window_step_seconds": manifest[
-                    "window_step_seconds"
-                ],
-                "normal_flight_count": int(
+                "window_duration_seconds": (
+                    manifest[
+                        "window_duration_seconds"
+                    ]
+                ),
+                "window_step_seconds": (
+                    manifest[
+                        "window_step_seconds"
+                    ]
+                ),
+                "no_failure_flight_count": int(
                     labeled_windows.loc[
                         labeled_windows[
-                            "target"
-                        ].eq(0),
+                            "window_label"
+                        ].eq("normal"),
+                        "flight_name"
+                    ].nunique()
+                ),
+                "pre_fault_training_flight_count": int(
+                    labeled_windows.loc[
+                        labeled_windows[
+                            "window_label"
+                        ].eq(
+                            "pre_fault_state"
+                        ),
                         "flight_name"
                     ].nunique()
                 ),
@@ -2227,13 +2182,13 @@ def main() -> None:
                     ].nunique()
                 ),
                 "training_sample_weighting": (
-                    "class_balanced_flight_"
-                    "balanced_window_weights"
+                    "class_balanced_flight_balanced_"
+                    "window_weights"
                 ),
-                "final_operating_threshold": (
-                    final_operating_threshold
+                "provisional_full_training_threshold": (
+                    provisional_full_training_threshold
                 ),
-                "final_threshold_calibration_normal_flight_count": int(
+                "final_threshold_calibration_normal_state_flight_count": int(
                     final_calibration_predictions[
                         "flight_name"
                     ].nunique()
@@ -2241,9 +2196,7 @@ def main() -> None:
                 "fault_family_reweighting": (
                     "not_applied"
                 ),
-                "feature_set": (
-                    args.feature_set
-                ),
+                "feature_set": args.feature_set,
                 "feature_representation": (
                     args.feature_set
                 ),
@@ -2263,9 +2216,7 @@ def main() -> None:
                 "window_roc_auc_standard_deviation": float(
                     fold_metrics[
                         "window_roc_auc"
-                    ].std(
-                        ddof = 0
-                    )
+                    ].std(ddof = 0)
                 ),
                 "flight_roc_auc_mean": float(
                     fold_metrics[
@@ -2275,9 +2226,7 @@ def main() -> None:
                 "flight_roc_auc_standard_deviation": float(
                     fold_metrics[
                         "flight_roc_auc"
-                    ].std(
-                        ddof = 0
-                    )
+                    ].std(ddof = 0)
                 ),
                 "pooled_flight_roc_auc": (
                     pooled_flight_roc_auc
@@ -2290,7 +2239,7 @@ def main() -> None:
 
         mlflow.log_dict(
             manifest,
-            "telemetry_windows_v2_manifest.json"
+            "telemetry_windows_v3_manifest.json"
         )
 
         mlflow.log_dict(
@@ -2322,10 +2271,10 @@ def main() -> None:
                         orient = "records"
                     )
                 ),
-                "final_operating_threshold": (
-                    final_operating_threshold
+                "provisional_full_training_threshold": (
+                    provisional_full_training_threshold
                 ),
-                "final_threshold_calibration_normal_flight_count": int(
+                "final_threshold_calibration_normal_state_flight_count": int(
                     final_calibration_predictions[
                         "flight_name"
                     ].nunique()
@@ -2398,7 +2347,7 @@ def main() -> None:
 
         print(
             "Final operating threshold : "
-            f"{final_operating_threshold:.6f}"
+            f"{provisional_full_training_threshold:.6f}"
         )
 
         print(
