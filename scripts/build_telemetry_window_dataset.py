@@ -15,6 +15,13 @@ CURATED_ROOT = PROJECT_ROOT / "data" / "alfa" / "curated"
 WINDOW_DURATION_SECONDS = 7
 WINDOW_STEP_SECONDS = 1
 
+# Allowing for the documented delay between physical fault activation
+# and the first 5 Hz failure-status ground-truth message
+FAULT_SIGNAL_MAXIMUM_DELAY_SECONDS = 0.2
+FAULT_SIGNAL_MAXIMUM_DELAY_NS = int(
+    FAULT_SIGNAL_MAXIMUM_DELAY_SECONDS * 1e9
+)
+
 WINDOW_STATISTICS = (
     "mean",
     "standard_deviation",
@@ -88,9 +95,7 @@ def ensure_inputs_exist() -> None:
             for path in missing_paths
         )
 
-        raise FileNotFoundError(
-            f"Required input paths not found : \n{missing_text}"
-        )
+        raise FileNotFoundError(f"Required input paths not found : \n{missing_text}")
 
 
 # Loading canonical file, flight and feature references
@@ -112,7 +117,9 @@ def load_reference_data() -> tuple[
     )
 
     if column_reference.empty:
-        raise RuntimeError("Training column reference does not contain feature columns.")
+        raise RuntimeError(
+            "Training column reference does not contain feature columns."
+        )
 
     return file_profile, flight_reference, column_reference
 
@@ -128,8 +135,7 @@ def build_feature_columns_by_topic(column_reference: pd.DataFrame) -> dict[str, 
 
 
 # Indexing the unique source file and timestamp column for each flight topic
-def build_source_file_index(file_profile: pd.DataFrame, 
-                            columns_by_topic: dict[str, list[str]]
+def build_source_file_index(file_profile: pd.DataFrame, columns_by_topic: dict[str, list[str]]
 ) -> dict[tuple[str, str], tuple[str, str]]:
     source_files = file_profile.loc[
         file_profile["topic_name"].isin(columns_by_topic),
@@ -173,6 +179,7 @@ def normalize_feature_name(value: str) -> str:
         "_",
         value
     ).strip("_").lower()
+
     if not normalized_value:
         raise ValueError(f"Unable to create a feature name from : {value}")
 
@@ -205,8 +212,7 @@ def build_feature_name_index(columns_by_topic: dict[str, list[str]]) -> dict[tup
                 existing_source is not None
                 and existing_source != source
             ):
-                raise RuntimeError(f"Feature-name collision detected between {existing_source} and {source}."
-                )
+                raise RuntimeError(f"Feature-name collision detected between {existing_source} and {source}.")
 
             source_by_feature_name[feature_name] = source
             feature_name_index[source] = feature_name
@@ -216,7 +222,8 @@ def build_feature_name_index(columns_by_topic: dict[str, list[str]]) -> dict[tup
 
 # Loading and validating all selected telemetry sources for one flight
 def load_flight_sources(flight_name: str, columns_by_topic: dict[str, list[str]],
-                        source_file_index: dict[tuple[str, str], tuple[str, str]]
+                        source_file_index: dict[tuple[str, str],
+                                                tuple[str, str]]
 ) -> dict[str, pd.DataFrame]:
     source_frames = {}
 
@@ -350,9 +357,7 @@ def add_series_statistics(record: dict, feature_name: str, values: pd.Series) ->
 
 
 # Measuring disagreement between commanded and measured aircraft behavior
-def add_command_response_features(record: dict, topic_name: str,
-                                  window_frame: pd.DataFrame
-) -> None:
+def add_command_response_features(record: dict, topic_name: str, window_frame: pd.DataFrame) -> None:
     command_response_columns = (
         COMMAND_RESPONSE_TOPICS.get(topic_name)
     )
@@ -462,8 +467,8 @@ def add_window_features(record: dict, source_frames: dict[str, pd.DataFrame],
         )
 
 
-# Assigning labels using the beginning of each complete telemetry window
-def get_window_labels(flight: dict, window_start_ns: int) -> tuple[str, str | None]:
+# Labeling only windows confirmed to be entirely before or after fault activation
+def get_window_labels(flight: dict, window_start_ns: int, window_end_ns: int) -> tuple[str, str | None]:
     if flight["fault_name"] == "no_failure":
         return "normal", None
 
@@ -471,16 +476,30 @@ def get_window_labels(flight: dict, window_start_ns: int) -> tuple[str, str | No
         flight["first_fault_signal_time"]
     )
 
-    if (
-        pd.notna(first_fault_signal_time)
-        and window_start_ns
-        >= int(round(first_fault_signal_time))
-    ):
+    if pd.isna(first_fault_signal_time):
+        return "unlabeled", None
+
+    first_fault_signal_ns = int(
+        round(first_fault_signal_time)
+    )
+
+    # The first status message can occur up to 0.2 seconds after activation,
+    # so only earlier windows can be treated as confirmed pre-fault data.
+    confirmed_pre_fault_end_ns = (
+        first_fault_signal_ns
+        - FAULT_SIGNAL_MAXIMUM_DELAY_NS
+    )
+
+    if window_end_ns <= confirmed_pre_fault_end_ns:
+        return "pre_fault_state", None
+
+    if window_start_ns >= first_fault_signal_ns:
         return (
             "fault_state",
             flight["fault_family"]
         )
 
+    # Excluding windows that overlap the uncertain fault-transition interval
     return "unlabeled", None
 
 
@@ -514,7 +533,7 @@ def build_feature_column_names(feature_name_index: dict[tuple[str, str], str]) -
     return feature_columns
 
 
-# Verifying that the causal baseline ends before any observed fault signal
+# Verifying that the causal baseline ends before the uncertain fault transition
 def validate_initial_baseline_period(window_dataset: pd.DataFrame, flight_reference: pd.DataFrame) -> None:
     ordered_windows = window_dataset.sort_values(
         [
@@ -566,15 +585,33 @@ def validate_initial_baseline_period(window_dataset: pd.DataFrame, flight_refere
     fault_reference = flight_reference.loc[
         flight_reference["fault_name"].ne(
             "no_failure"
-        ),
+        )
+        & flight_reference[
+            "first_fault_signal_time"
+        ].notna(),
         [
             "flight_name",
             "first_fault_signal_time"
         ]
-    ]
+    ].copy()
+
+    # Applying the same conservative transition boundary used for labels
+    fault_reference[
+        "confirmed_pre_fault_end_ns"
+    ] = (
+        fault_reference[
+            "first_fault_signal_time"
+        ]
+        - FAULT_SIGNAL_MAXIMUM_DELAY_NS
+    )
 
     baseline_summary = baseline_summary.merge(
-        fault_reference,
+        fault_reference[
+            [
+                "flight_name",
+                "confirmed_pre_fault_end_ns"
+            ]
+        ],
         on = "flight_name",
         how = "inner",
         validate = "one_to_one"
@@ -585,7 +622,7 @@ def validate_initial_baseline_period(window_dataset: pd.DataFrame, flight_refere
             "baseline_end_ns"
         ].gt(
             baseline_summary[
-                "first_fault_signal_time"
+                "confirmed_pre_fault_end_ns"
             ]
         )
     ]
@@ -597,7 +634,7 @@ def validate_initial_baseline_period(window_dataset: pd.DataFrame, flight_refere
             ].astype(str)
         )
 
-        raise RuntimeError(f"Initial baseline overlaps an observed fault period : {invalid_flights}")
+        raise RuntimeError(f"Initial baseline overlaps the uncertain fault-transition period : {invalid_flights}")
 
 
 # Adding features relative to causal history from the same flight
@@ -629,7 +666,9 @@ def add_causal_relative_features(window_dataset: pd.DataFrame, source_feature_co
     )
 
     if insufficient_flights:
-        raise RuntimeError(f"Flights do not contain enough windows for causal features : {insufficient_flights}")
+        raise RuntimeError("Flights do not contain enough windows for causal features : "
+            f"{insufficient_flights}"
+        )
 
     level_feature_columns = [
         column_name
@@ -739,7 +778,8 @@ def add_causal_relative_features(window_dataset: pd.DataFrame, source_feature_co
 
 # Building complete telemetry windows for every usable flight
 def build_window_dataset(flight_reference: pd.DataFrame, columns_by_topic: dict[str, list[str]],
-                         source_file_index: dict[tuple[str, str],tuple[str, str]], 
+                         source_file_index: dict[tuple[str, str],
+                                                 tuple[str, str]], 
                          feature_name_index: dict[tuple[str, str], str]
 ) -> pd.DataFrame:
     usable_flights = (
@@ -804,7 +844,8 @@ def build_window_dataset(flight_reference: pd.DataFrame, columns_by_topic: dict[
                 flight = flight,
                 window_start_ns = (
                     window_start_ns
-                )
+                ),
+                window_end_ns = window_end_ns
             )
 
             record = {
@@ -955,6 +996,7 @@ def validate_window_dataset(window_dataset: pd.DataFrame, flight_reference: pd.D
 
     allowed_labels = {
         "normal",
+        "pre_fault_state",
         "fault_state",
         "unlabeled"
     }
@@ -1054,22 +1096,22 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
 
     dataset_path = (
         CURATED_ROOT
-        / "telemetry_windows_v2.parquet"
+        / "telemetry_windows_v3.parquet"
     )
 
     manifest_path = (
         CURATED_ROOT
-        / "telemetry_windows_v2_manifest.json"
+        / "telemetry_windows_v3_manifest.json"
     )
 
     temporary_dataset_path = (
         CURATED_ROOT
-        / "telemetry_windows_v2.tmp.parquet"
+        / "telemetry_windows_v3.tmp.parquet"
     )
 
     temporary_manifest_path = (
         CURATED_ROOT
-        / "telemetry_windows_v2.tmp.json"
+        / "telemetry_windows_v3.tmp.json"
     )
 
     window_label_counts = {
@@ -1110,6 +1152,26 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
         "window_step_seconds": (
             WINDOW_STEP_SECONDS
         ),
+        "fault_signal_maximum_delay_seconds": (
+            FAULT_SIGNAL_MAXIMUM_DELAY_SECONDS
+        ),
+        "window_label_definitions": {
+            "normal": (
+                "Window from a no-failure flight."
+            ),
+            "pre_fault_state": (
+                "Fault-flight window ending before the confirmed "
+                "fault-transition boundary."
+            ),
+            "fault_state": (
+                "Window beginning at or after the first recorded "
+                "failure-status signal."
+            ),
+            "unlabeled": (
+                "Window overlapping the uncertain "
+                "fault-transition interval."
+            )
+        },
         "window_statistics": list(
             WINDOW_STATISTICS
         ),
@@ -1187,7 +1249,10 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
 
     print(f"Saved : {dataset_path}")
     print(f"Saved : {manifest_path}")
-    print(f"Telemetry windows created : {len(window_dataset)}")
+    print(
+        "Telemetry windows created : "
+        f"{len(window_dataset)}"
+    )
 
 
 # Building, validating and saving the telemetry window dataset
@@ -1249,5 +1314,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"Telemetry window dataset build failed : {exc}")
+        print(
+            "Telemetry window dataset build failed : "
+            f"{exc}"
+        )
         sys.exit(1)
