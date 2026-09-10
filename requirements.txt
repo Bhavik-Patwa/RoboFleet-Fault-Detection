@@ -14,3 +14,5 @@ mlflow
 lightgbm
 skops
 anyio == 4.14.1
+httpx2
+prefect
