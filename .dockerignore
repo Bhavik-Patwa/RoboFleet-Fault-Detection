@@ -1,0 +1,8 @@
+*
+!api/
+!api/**
+!deployment/
+!deployment/serving_bundle/
+!deployment/serving_bundle/**
+!requirements-serving.txt
+!Dockerfile

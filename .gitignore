@@ -24,3 +24,6 @@ tmp/
 
 # AWS S3 Access Key credentials
 robotics-fleet-data-ingestion_accessKeys.csv
+
+# Generated serving release
+deployment/serving_bundle/

@@ -1,0 +1,8 @@
+services:
+  telemetry-fault-detection-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telemetry-fault-detection-api:local
+    ports:
+      - "8000:8000"

@@ -1,3 +1,4 @@
+import os
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,12 +16,23 @@ TRACKING_DATABASE_PATH = PROJECT_ROOT / "mlflow.db"
 
 MODEL_NAME = "telemetry-fault-state-classifier"
 MODEL_ALIAS = "serving"
+SERVING_BUNDLE_ROOT = os.getenv(
+    "SERVING_BUNDLE_ROOT"
+)
 
 
 # Checking that the contract matches the loaded model and alert behavior
 def validate_prediction_contract(contract: dict, model, model_uri: str) -> None:
     if contract["registered_model_uri"] != model_uri:
         raise RuntimeError("Prediction contract identifies a different model version.")
+
+    if model.metadata.run_id != contract["source_run_id"]:
+        raise RuntimeError("Prediction contract and model have different source runs.")
+
+    expected_source_model_uri = (f"models:/{model.metadata.model_id}")
+
+    if contract["source_model_uri"] != expected_source_model_uri:
+        raise RuntimeError("Prediction contract identifies a different source model.")
 
     names = contract["feature_names"]
 
@@ -57,40 +69,69 @@ def validate_prediction_contract(contract: dict, model, model_uri: str) -> None:
         raise RuntimeError("Alert threshold must be finite and non-negative.")
 
 
-# Resolving the alias once so the model and contract use the same version
+# Loading either the local registry version or an immutable serving bundle
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.ready = False
 
-    if not TRACKING_DATABASE_PATH.exists():
-        raise RuntimeError("Tracking database is missing.")
+    if SERVING_BUNDLE_ROOT:
+        bundle_root = Path(
+            SERVING_BUNDLE_ROOT
+        ).resolve()
 
-    mlflow.set_tracking_uri(f"sqlite:///{TRACKING_DATABASE_PATH}")
+        model_load_uri = str(bundle_root / "model")
+        contract_path = (
+            bundle_root / "prediction_contract.json"
+        )
 
-    client = MlflowClient()
+        if not Path(model_load_uri).is_dir():
+            raise RuntimeError("Serving bundle does not contain a model.")
 
-    version = client.get_model_version_by_alias(
-        name = MODEL_NAME,
-        alias = MODEL_ALIAS
-    )
+        if not contract_path.is_file():
+            raise RuntimeError("Serving bundle does not contain a prediction contract.")
 
-    model_uri = f"models:/{MODEL_NAME}/{version.version}"
-    contract_uri = version.tags.get("prediction_contract_uri")
+        contract = json.loads(contract_path.read_text())
+        registered_model_uri = contract[
+            "registered_model_uri"
+        ]
 
-    if not contract_uri:
-        raise RuntimeError("Registered model version has no prediction contract.")
+    else:
+        if not TRACKING_DATABASE_PATH.exists():
+            raise RuntimeError("Tracking database is missing.")
 
-    contract_path = mlflow.artifacts.download_artifacts(
-        artifact_uri = contract_uri
-    )
+        mlflow.set_tracking_uri(f"sqlite:///{TRACKING_DATABASE_PATH}")
 
-    contract = json.loads(Path(contract_path).read_text())
-    model = mlflow.pyfunc.load_model(model_uri)
+        client = MlflowClient()
+
+        version = client.get_model_version_by_alias(
+            name = MODEL_NAME,
+            alias = MODEL_ALIAS
+        )
+
+        registered_model_uri = (f"models:/{MODEL_NAME}/{version.version}")
+
+        contract_uri = version.tags.get(
+            "prediction_contract_uri"
+        )
+
+        if not contract_uri:
+            raise RuntimeError("Registered model version has no prediction contract.")
+
+        contract_path = Path(
+            mlflow.artifacts.download_artifacts(
+                artifact_uri = contract_uri
+            )
+        )
+
+        contract = json.loads(contract_path.read_text())
+        model_load_uri = registered_model_uri
+
+    model = mlflow.pyfunc.load_model(model_load_uri)
 
     validate_prediction_contract(
         contract = contract,
         model = model,
-        model_uri = model_uri
+        model_uri = registered_model_uri
     )
 
     app.state.model = model
