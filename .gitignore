@@ -27,3 +27,10 @@ robotics-fleet-data-ingestion_accessKeys.csv
 
 # Generated serving release
 deployment/serving_bundle/
+
+# Local prediction monitoring state
+monitoring/prediction_events.db*
+
+# Generated model monitoring artifacts
+monitoring/reference/
+monitoring/reports/
