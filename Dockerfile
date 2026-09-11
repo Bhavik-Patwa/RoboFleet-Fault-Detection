@@ -3,6 +3,7 @@ FROM python:3.13.2-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV SERVING_BUNDLE_ROOT=/opt/robofleet/serving_bundle
+ENV PREDICTION_DATABASE_PATH=/var/lib/robofleet/prediction_events.db
 
 WORKDIR /app
 
@@ -23,8 +24,11 @@ RUN pip install \
 COPY api ./api
 COPY deployment/serving_bundle /opt/robofleet/serving_bundle
 
-# Running the service without root privileges
-RUN useradd --create-home --uid 10001 apiuser
+# Preparing persistent storage before dropping root privileges
+RUN useradd --create-home --uid 10001 apiuser \
+    && mkdir --parents /var/lib/robofleet \
+    && chown --recursive apiuser:apiuser /var/lib/robofleet
+
 USER apiuser
 
 EXPOSE 8000

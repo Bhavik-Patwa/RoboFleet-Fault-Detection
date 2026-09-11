@@ -9,7 +9,11 @@ import numpy as np
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException
 from mlflow.tracking import MlflowClient
-
+from api.prediction_store import (
+    PredictionStoreError,
+    initialize_prediction_store,
+    record_prediction_events
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRACKING_DATABASE_PATH = PROJECT_ROOT / "mlflow.db"
@@ -19,6 +23,16 @@ MODEL_ALIAS = "serving"
 SERVING_BUNDLE_ROOT = os.getenv(
     "SERVING_BUNDLE_ROOT"
 )
+PREDICTION_DATABASE_PATH = Path(
+    os.getenv(
+        "PREDICTION_DATABASE_PATH",
+        str(
+            PROJECT_ROOT
+            / "monitoring"
+            / "prediction_events.db"
+        )
+    )
+).resolve()
 
 
 # Checking that the contract matches the loaded model and alert behavior
@@ -134,6 +148,14 @@ async def lifespan(app: FastAPI):
         model_uri = registered_model_uri
     )
 
+    initialize_prediction_store(
+        database_path = PREDICTION_DATABASE_PATH
+    )
+
+    app.state.prediction_database_path = (
+        PREDICTION_DATABASE_PATH
+    )
+
     app.state.model = model
     app.state.contract = contract
     app.state.ready = True
@@ -245,16 +267,43 @@ def predict(records: list[dict[str, object]] = Body(...)) -> dict:
         )
 
     threshold = contract["alert_threshold"]
-    fault_scores = scores[:, contract["fault_score_column_index"]]
+    fault_scores = scores[
+        :,
+        contract["fault_score_column_index"]
+    ]
+
+    alerts = fault_scores >= threshold
+
+    try:
+        prediction_batch_id = record_prediction_events(
+            database_path = (
+                app.state.prediction_database_path
+            ),
+            model_uri = contract[
+                "registered_model_uri"
+            ],
+            features = features,
+            fault_scores = fault_scores,
+            alerts = alerts
+        )
+    except PredictionStoreError as exc:
+        raise HTTPException(
+            status_code = 500,
+            detail = "Prediction event could not be recorded."
+        ) from exc
 
     return {
+        "prediction_batch_id": prediction_batch_id,
         "model_uri": contract["registered_model_uri"],
         "threshold": threshold,
         "predictions": [
             {
                 "fault_score": float(score),
-                "alert": bool(score >= threshold)
+                "alert": bool(alert)
             }
-            for score in fault_scores
+            for score, alert in zip(
+                fault_scores,
+                alerts
+            )
         ]
     }

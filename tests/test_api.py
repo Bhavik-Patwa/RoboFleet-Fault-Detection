@@ -1,5 +1,8 @@
 import json
+import sqlite3
+import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 import mlflow.artifacts
@@ -8,13 +11,29 @@ import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
-from api.main import app
+import api.main as api_main
+
+
+app = api_main.app
 
 
 # Checking the real registered model through the API request interface
 class FaultDetectionAPITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.temporary_directory = (
+            tempfile.TemporaryDirectory()
+        )
+
+        cls.addClassCleanup(
+            cls.temporary_directory.cleanup
+        )
+
+        api_main.PREDICTION_DATABASE_PATH = (
+            Path(cls.temporary_directory.name)
+            / "prediction_events.db"
+        )
+
         # Entering the context runs the same startup checks as the server.
         cls.client = TestClient(app)
         cls.client.__enter__()
@@ -40,6 +59,81 @@ class FaultDetectionAPITests(unittest.TestCase):
         )
 
         cls.records = cls.features.to_dict(orient = "records")
+
+    def test_prediction_events_are_recorded(self) -> None:
+        response = self.client.post(
+            "/predict",
+            json = self.records
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        result = response.json()
+        batch_id = result["prediction_batch_id"]
+
+        # Closing the monitoring database after verifying persisted events
+        with closing(
+            sqlite3.connect(
+                api_main.PREDICTION_DATABASE_PATH
+            )
+        ) as connection:
+            events = connection.execute(
+                """
+                SELECT
+                    record_index,
+                    model_uri,
+                    fault_score,
+                    alert,
+                    features_json
+                FROM prediction_events
+                WHERE batch_id = ?
+                ORDER BY record_index
+                """,
+                (batch_id,)
+            ).fetchall()
+
+        self.assertEqual(
+            len(events),
+            len(self.records)
+        )
+
+        for record_index, event in enumerate(events):
+            (
+                stored_record_index,
+                model_uri,
+                fault_score,
+                alert,
+                features_json
+            ) = event
+
+            self.assertEqual(
+                stored_record_index,
+                record_index
+            )
+
+            self.assertEqual(
+                model_uri,
+                self.contract["registered_model_uri"]
+            )
+
+            self.assertEqual(
+                fault_score,
+                result["predictions"][
+                    record_index
+                ]["fault_score"]
+            )
+
+            self.assertEqual(
+                bool(alert),
+                result["predictions"][
+                    record_index
+                ]["alert"]
+            )
+
+            self.assertEqual(
+                len(json.loads(features_json)),
+                len(self.contract["feature_names"])
+            )
 
     def test_health_and_readiness(self) -> None:
         self.assertEqual(self.client.get("/health").status_code, 200)

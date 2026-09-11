@@ -6,3 +6,8 @@ services:
     image: telemetry-fault-detection-api:local
     ports:
       - "8000:8000"
+    volumes:
+      - prediction-events:/var/lib/robofleet
+
+volumes:
+  prediction-events:
