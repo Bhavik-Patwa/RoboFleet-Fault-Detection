@@ -17,7 +17,7 @@ import api.main as api_main
 app = api_main.app
 
 
-# Checking the real registered model through the API request interface
+# Checking the configured serving model through the API request interface
 class FaultDetectionAPITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -43,10 +43,23 @@ class FaultDetectionAPITests(unittest.TestCase):
         response.raise_for_status()
         cls.contract = response.json()
 
-        model_path = Path(
-            mlflow.artifacts.download_artifacts(
-                artifact_uri = cls.contract["registered_model_uri"]
+        # Loading either the configured bundle or the local registered model
+        if api_main.SERVING_BUNDLE_ROOT:
+            model_path = (
+                Path(api_main.SERVING_BUNDLE_ROOT).resolve()
+                / "model"
             )
+        else:
+            model_path = Path(
+                mlflow.artifacts.download_artifacts(
+                    artifact_uri = cls.contract[
+                        "registered_model_uri"
+                    ]
+                )
+            )
+
+        cls.native_model_uri = str(
+            model_path
         )
 
         example = json.loads(
@@ -141,7 +154,7 @@ class FaultDetectionAPITests(unittest.TestCase):
 
     def test_predictions_match_native_model(self) -> None:
         native_model = mlflow.sklearn.load_model(
-            self.contract["registered_model_uri"]
+            self.native_model_uri
         )
 
         expected_scores = native_model.predict_proba(
