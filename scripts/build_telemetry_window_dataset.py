@@ -11,6 +11,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_ROOT = PROJECT_ROOT / "data" / "alfa" / "processed"
 METADATA_ROOT = PROJECT_ROOT / "data" / "alfa" / "metadata"
 CURATED_ROOT = PROJECT_ROOT / "data" / "alfa" / "curated"
+DATA_ROOT = PROJECT_ROOT / "data" / "alfa"
+
+DATASET_MANIFEST_PATH = (
+    PROJECT_ROOT / "dataset_manifest.json"
+)
+
+ACQUISITION_MANIFEST_PATH = (
+    PROJECT_ROOT / "dataset_acquisition_manifest.json"
+)
 
 WINDOW_DURATION_SECONDS = 7
 WINDOW_STEP_SECONDS = 1
@@ -80,7 +89,9 @@ def ensure_inputs_exist() -> None:
         PROCESSED_ROOT,
         METADATA_ROOT / "processed_dataset_file_profile.csv",
         METADATA_ROOT / "training_flight_reference.csv",
-        METADATA_ROOT / "training_column_reference.csv"
+        METADATA_ROOT / "training_column_reference.csv",
+        ACQUISITION_MANIFEST_PATH,
+        DATASET_MANIFEST_PATH
     ]
 
     missing_paths = [
@@ -1085,6 +1096,140 @@ def calculate_file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Verifying that processed telemetry matches its acquisition provenance
+def validate_processed_data_acquisition() -> None:
+    acquisition_manifest = json.loads(
+        ACQUISITION_MANIFEST_PATH.read_text()
+    )
+
+    dataset_manifest = json.loads(
+        DATASET_MANIFEST_PATH.read_text()
+    )
+
+    expected_identity = {
+        "dataset_name": dataset_manifest["dataset_name"],
+        "bucket_name": dataset_manifest["bucket_name"],
+        "bucket_prefix": dataset_manifest["bucket_prefix"]
+    }
+
+    actual_identity = {
+        key: acquisition_manifest.get(key)
+        for key in expected_identity
+    }
+
+    if actual_identity != expected_identity:
+        raise RuntimeError("Dataset acquisition manifest identifies a different dataset.")
+
+    object_index = acquisition_manifest.get(
+        "objects"
+    )
+
+    if not isinstance(object_index, dict):
+        raise RuntimeError("Dataset acquisition manifest has an invalid object index.")
+
+    object_records = [
+        object_index[object_key]
+        for object_key in sorted(object_index)
+    ]
+
+    revision_payload = json.dumps(
+        object_records,
+        sort_keys = True,
+        separators = (",", ":")
+    ).encode("utf-8")
+
+    expected_revision = hashlib.sha256(
+        revision_payload
+    ).hexdigest()
+
+    if (
+        acquisition_manifest.get(
+            "dataset_revision_sha256"
+        )
+        != expected_revision
+    ):
+        raise RuntimeError("Dataset acquisition manifest revision is invalid.")
+
+    section_revisions = acquisition_manifest.get(
+        "section_revision_sha256"
+    )
+
+    if not isinstance(section_revisions, dict):
+        raise RuntimeError("Dataset acquisition manifest has invalid section revisions.")
+
+    processed_object_records = [
+        object_index[object_key]
+        for object_key in sorted(object_index)
+        if object_index[object_key].get(
+            "section"
+        ) == "processed"
+    ]
+
+    if not processed_object_records:
+        raise RuntimeError("Dataset acquisition manifest contains no processed objects.")
+
+    processed_revision_payload = json.dumps(
+        processed_object_records,
+        sort_keys = True,
+        separators = (",", ":")
+    ).encode("utf-8")
+
+    expected_processed_revision = hashlib.sha256(
+        processed_revision_payload
+    ).hexdigest()
+
+    if (
+        section_revisions.get("processed")
+        != expected_processed_revision
+    ):
+        raise RuntimeError("Processed dataset acquisition revision is invalid.")
+
+    recorded_csv_paths = set()
+
+    for object_key, record in object_index.items():
+        if (
+            record.get("section") != "processed"
+            or not str(
+                record.get("relative_path", "")
+            ).endswith(".csv")
+        ):
+            continue
+
+        if record.get("object_key") != object_key:
+            raise RuntimeError("Dataset acquisition object index is inconsistent.")
+
+        source_path = (
+            DATA_ROOT
+            / record["relative_path"]
+        ).resolve()
+
+        if not source_path.is_relative_to(
+            PROCESSED_ROOT.resolve()
+        ):
+            raise RuntimeError(f"Acquired file resolves outside processed data : {source_path}")
+
+        if (
+            not source_path.is_file()
+            or source_path.stat().st_size
+            != int(record["size_bytes"])
+            or calculate_file_sha256(source_path)
+            != record["local_sha256"]
+        ):
+            raise RuntimeError(f"Processed telemetry does not match acquisition provenance : {source_path}")
+
+        recorded_csv_paths.add(source_path)
+
+    local_csv_paths = {
+        source_path.resolve()
+        for source_path in PROCESSED_ROOT.rglob(
+            "*.csv"
+        )
+    }
+
+    if recorded_csv_paths != local_csv_paths:
+        raise RuntimeError("Processed CSV files do not match the acquisition manifest.")
+
+
 # Writing the versioned dataset and reproducibility manifest atomically
 def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list[str]],
                   feature_name_index: dict[tuple[str, str], str]
@@ -1145,7 +1290,43 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
         ]
     )
 
+    acquisition_manifest = json.loads(
+        ACQUISITION_MANIFEST_PATH.read_text()
+    )
+
+    if (
+        acquisition_manifest.get(
+            "manifest_schema_version"
+        )
+        != 1
+    ):
+        raise RuntimeError("Dataset acquisition manifest has an unsupported schema version.")
+
+    processed_revision = (
+        acquisition_manifest
+        .get("section_revision_sha256", {})
+        .get("processed")
+    )
+
+    if not isinstance(processed_revision, str):
+        raise RuntimeError("Dataset acquisition manifest does not contain a processed-section revision.")
+
     manifest = {
+        "dataset_acquisition": {
+            "manifest_sha256": (
+                calculate_file_sha256(
+                    ACQUISITION_MANIFEST_PATH
+                )
+            ),
+            "dataset_revision_sha256": (
+                acquisition_manifest[
+                    "dataset_revision_sha256"
+                ]
+            ),
+            "processed_section_revision_sha256": (
+                processed_revision
+            )
+        },
         "window_duration_seconds": (
             WINDOW_DURATION_SECONDS
         ),
@@ -1226,26 +1407,59 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
         }
     }
 
-    window_dataset.to_parquet(
-        temporary_dataset_path,
-        index = False
-    )
+    try:
+        window_dataset.to_parquet(
+            temporary_dataset_path,
+            index = False
+        )
 
-    temporary_manifest_path.write_text(
-        json.dumps(
-            manifest,
-            indent = 2,
-            sort_keys = True
-        ) + "\n"
-    )
+        # Preserving the immutable dataset bytes associated with the serving model
+        if dataset_path.exists():
+            existing_dataset = pd.read_parquet(
+                dataset_path
+            )
 
-    temporary_dataset_path.replace(
-        dataset_path
-    )
+            try:
+                pd.testing.assert_frame_equal(
+                    existing_dataset,
+                    window_dataset,
+                    check_dtype = False,
+                    check_exact = True
+                )
 
-    temporary_manifest_path.replace(
-        manifest_path
-    )
+            except AssertionError as exc:
+                raise RuntimeError(
+                    "Regenerated telemetry windows differ from the existing versioned dataset. "
+                    "Create a new dataset version instead of replacing telemetry_windows_v3."
+                ) from exc
+
+            temporary_dataset_path.unlink()
+
+        else:
+            temporary_dataset_path.replace(
+                dataset_path
+            )
+
+        temporary_manifest_path.write_text(
+            json.dumps(
+                manifest,
+                indent = 2,
+                sort_keys = True
+            ) + "\n"
+        )
+
+        temporary_manifest_path.replace(
+            manifest_path
+        )
+
+    finally:
+        temporary_dataset_path.unlink(
+            missing_ok = True
+        )
+
+        temporary_manifest_path.unlink(
+            missing_ok = True
+        )
 
     print(f"Saved : {dataset_path}")
     print(f"Saved : {manifest_path}")
@@ -1258,6 +1472,7 @@ def write_outputs(window_dataset: pd.DataFrame, columns_by_topic: dict[str, list
 # Building, validating and saving the telemetry window dataset
 def main() -> None:
     ensure_inputs_exist()
+    validate_processed_data_acquisition()
 
     (
         file_profile,
